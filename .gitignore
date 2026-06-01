@@ -1,0 +1,23 @@
+# secrets / credentials — NEVER commit
+.env.local
+.env
+invoice-automation-*.json
+*-service-account*.json
+.refresh_token
+apps-script/Code.local.gs
+
+# vercel
+.vercel
+
+# node / next
+node_modules/
+.next/
+*.log
+
+# local test + diagnostic artifacts
+g.html
+test_invoice.jpg
+test_invoice_b64.txt
+*.output
+
+tsconfig.tsbuildinfo
