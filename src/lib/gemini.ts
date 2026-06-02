@@ -59,13 +59,16 @@ export async function classifyDocument(
   mimeType: string
 ): Promise<ClassificationResult> {
   const prompt = `You are a document classifier.
-Determine whether this file is an invoice, receipt, bill, or expense-related document.
+Determine whether this file is an invoice, receipt, bill, or other proof-of-payment / expense document.
+This includes: store receipts, ride/taxi receipts (Gett, Uber), utility bills, subscription invoices,
+insurance payment confirmations, and Hebrew documents (חשבונית, חשבונית מס, קבלה, אישור תשלום).
+Hebrew documents may have reversed/right-to-left text — that does not make them less valid.
 Return JSON only:
 {"is_invoice": boolean, "confidence": number}
 Rules:
-- Only classify financial documents as true
-- If uncertain, return false
-- Do not guess`;
+- If the document shows a business/vendor name and a paid or due amount, it IS an expense document
+- Marketing emails, newsletters, product images, screenshots of websites, and personal photos
+  without payment details are NOT expense documents`;
 
   return (await generateWithRetry(content, mimeType, prompt)) as ClassificationResult;
 }

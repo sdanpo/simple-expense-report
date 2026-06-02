@@ -115,21 +115,36 @@ function backfillRecentReceipts() {
 }
 
 /**
- * One-time helper: move EVERYTHING currently in the Drive Inbox to the trash.
- * Use this to clear the ~350 junk files the old (pre-fix) script ingested.
+ * One-time helper: move EVERYTHING currently in the Drive Inbox AND Ignored folders
+ * to the trash. Use this to clear the junk files the old (pre-fix) script ingested,
+ * including real receipts that were misclassified into Ignored.
  * Safe: every file was extracted from a Gmail message that still exists, and real
  * receipts get re-ingested cleanly by backfillRecentReceipts(). Trash is recoverable
- * for 30 days.
+ * for 30 days. The Processed folder (files already in the Sheet) is NOT touched.
  */
 function resetInboxTrashAllFiles() {
   const inbox = DriveApp.getFolderById(CONFIG.INBOX_FOLDER_ID);
-  const files = inbox.getFiles();
+  let count = trashAllIn_(inbox);
+  // Also clear sibling "Ignored" folder — junk plus possible false negatives.
+  const parents = inbox.getParents();
+  if (parents.hasNext()) {
+    const siblings = parents.next().getFolders();
+    while (siblings.hasNext()) {
+      const folder = siblings.next();
+      if (folder.getName() === 'Ignored') count += trashAllIn_(folder);
+    }
+  }
+  Logger.log('Moved ' + count + ' file(s) to the trash.');
+}
+
+function trashAllIn_(folder) {
+  const files = folder.getFiles();
   let count = 0;
   while (files.hasNext()) {
     files.next().setTrashed(true);
     count++;
   }
-  Logger.log('Moved ' + count + ' file(s) from the Inbox to the trash.');
+  return count;
 }
 
 function ingestLabeledThreads_(deadline) {
