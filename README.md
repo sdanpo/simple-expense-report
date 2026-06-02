@@ -48,13 +48,15 @@ Upload directly to the [Inbox folder](https://drive.google.com/drive/folders/1ea
 1. Open https://script.google.com → your invoice project (or **New project**)
 2. Replace the code with the contents of `apps-script/Code.gs`
 3. Enable the **Gmail Advanced Service**: Editor sidebar → Services **+** → Gmail → Add
-4. Paste the real `CRON_SECRET` into `CONFIG.CRON_SECRET` (value in Vercel → Settings → Env Vars)
-5. Select function **`setup`** → Run → authorize. This also **deletes the rogue Gmail
+4. Replace the manifest: ⚙️ Project Settings → "Show appsscript.json manifest file in editor" →
+   paste `apps-script/appsscript.json` (adds the `gmail.settings.basic` scope needed to manage filters)
+5. Paste the real `CRON_SECRET` into `CONFIG.CRON_SECRET` (value in Vercel → Settings → Env Vars)
+6. Select function **`setup`** → Run → authorize. This also **deletes the rogue Gmail
    filter** that was labeling all incoming mail as `invoice-ingested`, and creates two
    new filters: keyword-matching receipts + self-sent emails with attachments.
-6. Run **`resetInboxTrashAllFiles`** once — clears the ~350 junk files the old script
+7. Run **`resetInboxTrashAllFiles`** once — clears the ~350 junk files the old script
    ingested (recoverable from trash for 30 days).
-7. Run **`backfillRecentReceipts`** once — re-ingests real receipt emails from the last
+8. Run **`backfillRecentReceipts`** once — re-ingests real receipt emails from the last
    30 days (including photos you emailed to yourself) and processes them into the Sheet.
 
 ## Incident notes (2026-06-02)
