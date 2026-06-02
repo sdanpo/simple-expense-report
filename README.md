@@ -4,45 +4,77 @@
 **Drive folder:** https://drive.google.com/drive/folders/1EaS0WCSTQutUK7VigyxeTIve8LHTKRFx
 **Sheet:** https://docs.google.com/spreadsheets/d/1dSWFwyXy9wdXMYpjPsrbRCPDVZj8_bI2d4qauCkIAA8
 
-## What works right now (deployed + tested end-to-end)
+## Pipeline
 
 Photo/PDF → Drive `Invoices/Inbox` → Gemini classify+extract → Google Sheet → file moved to `Processed`/`Ignored`.
 
-Verified in production:
-- ✅ Real invoice PDF (BigDeal, 255 ILS) → extracted + Approved + row in Sheet
-- ✅ Real invoice PDF (Rami Levy, 284.98 ILS) → extracted + Approved
-- ✅ Non-invoice photo → routed to `Ignored`
-- ✅ Unsupported file type → routed to `Ignored`
-- ✅ Empty inbox → idempotent (no double-processing)
-- ✅ Gemini transient 503 → auto-retry with backoff, then succeeds
+| Concern | Mechanism |
+|---------|-----------|
+| Drive read / move, Sheets write | **Service account** (no token to expire) |
+| Gemini classify + extract | `gemini-2.5-flash` (2.0-flash lost free-tier quota; override via `GEMINI_MODEL` env) |
+| Invoice processing | Vercel route `/api/cron/process-invoices` (6 files per call, caller re-invokes until `remaining: 0`) |
+| Scheduling | Vercel cron daily 06:00 UTC **+** Apps Script hourly run |
+| **Gmail → Inbox ingestion** | **Google Apps Script** (`apps-script/Code.gs`) — label-based |
+| **Phone camera → Inbox** | **Background sync app** (see below) — no manual sharing |
 
-## Architecture (final)
+## How invoices get in (100% hands-free)
 
-| Concern | Mechanism | Why |
-|---------|-----------|-----|
-| Drive read / move, Sheets write | **Service account** | Works for user-owned files; no token to expire |
-| Gemini classify + extract | `gemini-2.5-flash` | `gemini-1.5-flash` was retired |
-| Invoice processing | Vercel route `/api/cron/process-invoices` | Proven pipeline |
-| Scheduling | Vercel cron daily 06:00 UTC **+** Apps Script hourly ping | Hobby plan caps native cron at daily |
-| **Gmail → Inbox ingestion** | **Google Apps Script** (`apps-script/Code.gs`) | Runs *as you* — no OAuth client/consent/verification/7-day-expiry headaches that blocked the service-account + OAuth route |
+### 1. Email (Gmail filter + label)
+A Gmail filter applies the **`AutoInvoiced`** label to incoming emails that look like
+invoices/receipts. Every hour the Apps Script:
+1. Takes `AutoInvoiced` threads not yet marked **`AutoInvoiced-done`**
+2. Saves their *real* attachments (PDF/images — inline signature logos and tracking
+   pixels are skipped, octet-stream PDFs are normalized) into Drive `Invoices/Inbox`
+3. Marks the thread `AutoInvoiced-done`
+4. Pings the Vercel processor until the Inbox is drained (within a strict 4-minute
+   budget so it can never exceed Apps Script's execution limit)
 
-### Why not service-account upload / OAuth client for Gmail?
-- Service accounts have **no personal-Drive storage quota** → cannot upload files.
-- A standalone OAuth client for a personal Gmail with restricted scopes (gmail.modify, drive) triggers unverified-app friction and token expiry. Apps Script avoids all of it.
+**Manual override:** apply the `AutoInvoiced` label by hand to any email and it gets
+ingested on the next hourly run.
 
-## Ways invoices get in
+### 2. Phone camera (background sync app — set up once)
+Install a sync app and point it at the Drive `Invoices/Inbox` folder:
+- **Android:** [Autosync for Google Drive](https://play.google.com/store/apps/details?id=com.ttxapps.drivesync) —
+  create a one-way sync pair: a phone album/folder (e.g. "Receipts") → Drive `Invoices/Inbox`.
+- **iPhone:** "Sync with Google Drive" (Pixegram) — same idea: sync a Photos album → `Invoices/Inbox`.
 
-1. **Phone (primary):** photo → Share → Google Drive → `Invoices/Inbox`. Works now.
-2. **Manual:** upload to the Inbox folder. Works now.
-3. **Email:** Apps Script pulls Gmail attachments hourly (after the 2-min setup below).
+Then: take a photo of the receipt → it lands in the Inbox automatically → processed within the hour.
 
-## Remaining setup — Gmail ingestion (one time, ~2 min)
+### 3. Manual
+Upload directly to the [Inbox folder](https://drive.google.com/drive/folders/1eaCs2dx-ZxwZYGA6xaqNQrKXblO7xWQG).
 
-1. Open https://script.google.com → **New project**
-2. Delete the stub, paste the contents of `apps-script/Code.gs`
-3. Click **Save**, then select function **`setup`** in the toolbar and click **Run**
-4. Authorize when prompted (your own script — pick account → Advanced → Go to project → Allow)
-5. Done. It now ingests Gmail invoice attachments **and** pings the processor every hour.
+## Apps Script setup / update (~3 min)
+
+1. Open https://script.google.com → your invoice project (or **New project**)
+2. Replace the code with the contents of `apps-script/Code.gs`
+3. Enable the **Gmail Advanced Service**: Editor sidebar → Services **+** → Gmail → Add
+4. Paste the real `CRON_SECRET` into `CONFIG.CRON_SECRET` (value in Vercel → Settings → Env Vars)
+5. Select function **`setup`** → Run → authorize. This also **deletes the rogue Gmail
+   filter** that was labeling all incoming mail as `invoice-ingested`, and creates two
+   new filters: keyword-matching receipts + self-sent emails with attachments.
+6. Run **`resetInboxTrashAllFiles`** once — clears the ~350 junk files the old script
+   ingested (recoverable from trash for 30 days).
+7. Run **`backfillRecentReceipts`** once — re-ingests real receipt emails from the last
+   30 days (including photos you emailed to yourself) and processes them into the Sheet.
+
+## Incident notes (2026-06-02)
+
+What broke and how it was fixed:
+1. **Junk flood:** old script matched keywords anywhere incl. "payment" and saved *inline*
+   images (signature logos, auction pictures). → Now: inline images excluded, tiny files
+   excluded, tighter keywords.
+2. **6-minute timeouts ("ran endlessly"):** unbounded ingestion + up to 30 processor pings.
+   → Now: hard 4-minute time budget on every run.
+3. **Rogue Gmail filter** auto-applied `invoice-ingested` to ALL incoming mail, so new
+   receipts were pre-excluded from ingestion. → Now: `setup()` removes it; the script uses
+   new labels (`AutoInvoiced` / `AutoInvoiced-done`).
+4. **octet-stream PDFs skipped** (e.g. Menora insurance docs). → Now: type resolved from
+   file extension and normalized on save.
+5. **Processing never triggered:** `CRON_SECRET` left as placeholder in Apps Script → 401.
+   → Now: explicit warning at setup; paste the real secret.
+6. **Gemini free tier removed for `gemini-2.0-flash`** (429, `limit: 0`) → every file
+   errored and bounced back to the Inbox. → Now: `gemini-2.5-flash` by default,
+   configurable via `GEMINI_MODEL`.
 
 ## Manual controls
 
@@ -50,9 +82,13 @@ Trigger processing now:
 ```bash
 curl -H "Authorization: Bearer <CRON_SECRET>" https://simpleexpensereport.vercel.app/api/cron/process-invoices
 ```
+Repeat until the response shows `"remaining": 0`.
 
 ## Repo scripts (local diagnostics, use `.env.local`)
 - `scripts/test-gemini.js` — Gemini on a local image
 - `scripts/run-pipeline-local.js` — full pipeline locally via service account
 - `scripts/verify-and-clean.js` — read Sheet + folder state
 - `scripts/cleanup-test-artifacts.js` — clear test rows/files
+
+> Note: `.env.local` is gitignored and not present on this machine — recreate it from
+> `.env.example` with values from the Vercel dashboard to run local scripts.

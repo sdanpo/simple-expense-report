@@ -2,9 +2,9 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import type { ClassificationResult, InvoiceData } from './types';
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-// gemini-2.0-flash: fast, no "thinking" latency — keeps each file well under the
-// serverless function timeout. Accurate enough for invoice classify/extract.
-const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+// gemini-2.5-flash: gemini-2.0-flash no longer has free-tier quota (429, limit: 0).
+// Override with the GEMINI_MODEL env var if quotas change again.
+const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || 'gemini-2.5-flash' });
 
 const SUPPORTED_MIME_TYPES = new Set([
   'image/jpeg',
