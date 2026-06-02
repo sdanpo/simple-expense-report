@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { listInboxFiles, downloadFile, moveFile } from '@/lib/drive';
-import { classifyDocument, extractInvoiceData, isSupportedMimeType } from '@/lib/gemini';
+import { analyzeDocument, isSupportedMimeType } from '@/lib/gemini';
 import { appendRow, ensureSheetHeaders } from '@/lib/sheets';
 import type { SheetRow, InvoiceStatus } from '@/lib/types';
 
@@ -9,7 +9,7 @@ export const dynamic = 'force-dynamic';
 
 // Cap files per invocation so we never hit the serverless function timeout.
 // Caller (Apps Script / cron) re-invokes until `remaining` reaches 0.
-const MAX_FILES_PER_RUN = Number(process.env.MAX_FILES_PER_RUN) || 6;
+const MAX_FILES_PER_RUN = Number(process.env.MAX_FILES_PER_RUN) || 4;
 
 export async function GET(req: NextRequest) {
   if (!isAuthorized(req)) {
@@ -58,17 +58,14 @@ async function processFile(file: { id: string; name: string; mimeType: string; w
   try {
     const content = await downloadFile(file.id);
 
-    // Step 1: Classify
-    const classification = await classifyDocument(content, file.mimeType);
-    if (!classification.is_invoice || classification.confidence < 0.5) {
+    // Single Gemini call: classify + extract together (free-tier quota is scarce).
+    const invoice = await analyzeDocument(content, file.mimeType);
+    if (!invoice.is_invoice || invoice.confidence < 0.5) {
       await moveFile(file.id, process.env.GOOGLE_DRIVE_IGNORED_ID!);
       return { file: file.name, status: 'ignored_not_invoice' };
     }
 
-    // Step 2: Extract
-    const invoice = await extractInvoiceData(content, file.mimeType);
-
-    // Step 3: Validate
+    // Validate
     const autoApprove =
       invoice.vendor !== null &&
       invoice.invoice_date !== null &&
@@ -76,7 +73,7 @@ async function processFile(file: { id: string; name: string; mimeType: string; w
       invoice.confidence >= 0.8;
     const status: InvoiceStatus = autoApprove ? 'Approved' : 'Needs Review';
 
-    // Step 4: Write to Sheets (file already in Processed from the claim step)
+    // Write to Sheets (file already in Processed from the claim step)
     const row: SheetRow = {
       vendor: invoice.vendor ?? '',
       invoice_date: invoice.invoice_date ?? '',

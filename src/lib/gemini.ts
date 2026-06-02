@@ -1,10 +1,11 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import type { ClassificationResult, InvoiceData } from './types';
+import type { DocumentAnalysis } from './types';
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-// gemini-2.5-flash: gemini-2.0-flash no longer has free-tier quota (429, limit: 0).
+// gemini-2.5-flash-lite: fast (no thinking latency), and its free-tier daily quota is a
+// SEPARATE pool from gemini-2.5-flash / 2.0-flash (which are tiny: ~20 requests/day).
 // Override with the GEMINI_MODEL env var if quotas change again.
-const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || 'gemini-2.5-flash' });
+const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite' });
 
 const SUPPORTED_MIME_TYPES = new Set([
   'image/jpeg',
@@ -54,48 +55,39 @@ async function generateWithRetry(content: Buffer, mimeType: string, prompt: stri
   throw lastErr;
 }
 
-export async function classifyDocument(
+/**
+ * Classify AND extract in a single Gemini call — the free-tier daily request quota is
+ * very small, so every file must cost exactly one request.
+ */
+export async function analyzeDocument(
   content: Buffer,
   mimeType: string
-): Promise<ClassificationResult> {
-  const prompt = `You are a document classifier.
-Determine whether this file is an invoice, receipt, bill, or other proof-of-payment / expense document.
+): Promise<DocumentAnalysis> {
+  const prompt = `You are an expense-document analyzer.
+
+Step 1 — classify: is this file an invoice, receipt, bill, or other proof-of-payment / expense document?
 This includes: store receipts, ride/taxi receipts (Gett, Uber), utility bills, subscription invoices,
 insurance payment confirmations, and Hebrew documents (חשבונית, חשבונית מס, קבלה, אישור תשלום).
 Hebrew documents may have reversed/right-to-left text — that does not make them less valid.
+If the document shows a business/vendor name and a paid or due amount, it IS an expense document.
+Marketing emails, newsletters, product images, screenshots, and personal photos without payment
+details are NOT expense documents.
+
+Step 2 — if it IS an expense document, extract its data. If not, use null for all fields.
+
 Return JSON only:
-{"is_invoice": boolean, "confidence": number}
-Rules:
-- If the document shows a business/vendor name and a paid or due amount, it IS an expense document
-- Marketing emails, newsletters, product images, screenshots of websites, and personal photos
-  without payment details are NOT expense documents`;
-
-  return (await generateWithRetry(content, mimeType, prompt)) as ClassificationResult;
-}
-
-export async function extractInvoiceData(
-  content: Buffer,
-  mimeType: string
-): Promise<InvoiceData> {
-  const prompt = `You are an invoice extraction engine.
-Extract structured invoice data.
-Return JSON only.
-Fields:
 {
+  "is_invoice": boolean,
+  "confidence": number,        // 0.0-1.0 certainty of classification AND extraction
   "vendor": string | null,
-  "invoice_date": string | null,
+  "invoice_date": string | null,   // YYYY-MM-DD
   "total_amount": number | null,
-  "currency": string | null,
+  "currency": string | null,       // 3-letter ISO code (ILS, USD, EUR, ...)
   "tax_amount": number | null,
-  "invoice_number": string | null,
-  "confidence": number
+  "invoice_number": string | null
 }
 Rules:
-- Do not invent values
-- Use null if unknown
-- invoice_date format: YYYY-MM-DD
-- currency: 3-letter ISO code (ILS, USD, EUR, etc.)
-- confidence: 0.0 to 1.0 reflecting certainty of extraction`;
+- Do not invent values; use null if unknown`;
 
-  return (await generateWithRetry(content, mimeType, prompt)) as InvoiceData;
+  return (await generateWithRetry(content, mimeType, prompt)) as DocumentAnalysis;
 }

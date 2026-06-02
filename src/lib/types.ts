@@ -13,6 +13,11 @@ export interface ClassificationResult {
   confidence: number;
 }
 
+/** Combined classify + extract result — one Gemini call per file (quota is scarce). */
+export interface DocumentAnalysis extends InvoiceData {
+  is_invoice: boolean;
+}
+
 export type InvoiceStatus = 'Approved' | 'Needs Review' | 'Ignored';
 
 export interface SheetRow {
