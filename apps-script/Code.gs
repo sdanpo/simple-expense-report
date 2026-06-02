@@ -137,6 +137,19 @@ function resetInboxTrashAllFiles() {
   Logger.log('Moved ' + count + ' file(s) to the trash.');
 }
 
+/**
+ * One-time helper: un-mark recently ingested threads so any attachments missing from
+ * Drive get re-ingested. Safe — the filename dedup skips files that already exist in
+ * Inbox/Processed/Ignored, so nothing gets duplicated.
+ */
+function forceReingest() {
+  const done = ensureLabel_(CONFIG.DONE_LABEL);
+  const threads = GmailApp.search('label:' + CONFIG.INGEST_LABEL + ' newer_than:7d', 0, 50);
+  threads.forEach(function (t) { t.removeLabel(done); });
+  Logger.log('Cleared done-mark from ' + threads.length + ' thread(s). Re-ingesting...');
+  runHourly();
+}
+
 function trashAllIn_(folder) {
   const files = folder.getFiles();
   let count = 0;
