@@ -94,10 +94,23 @@ async function processFile(file: { id: string; name: string; mimeType: string; w
 
     return { file: file.name, status: status.toLowerCase().replace(' ', '_') };
   } catch (err) {
+    // Permanent input errors (corrupted/unreadable file) can never succeed —
+    // route to Ignored instead of retrying forever.
+    if (isPermanentError(err)) {
+      await moveFile(file.id, process.env.GOOGLE_DRIVE_IGNORED_ID!).catch(() => {});
+      return { file: file.name, status: 'ignored_unprocessable' };
+    }
     // Roll back the claim so the file is retried next cycle.
     await moveFile(file.id, process.env.GOOGLE_DRIVE_INBOX_ID!).catch(() => {});
     throw err;
   }
+}
+
+// 400-class errors mean the file itself cannot be processed (corrupted image,
+// unsupported content) — retrying will never help.
+function isPermanentError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /\b400\b|Bad Request|Unable to process input/i.test(msg);
 }
 
 function isAuthorized(req: NextRequest): boolean {
