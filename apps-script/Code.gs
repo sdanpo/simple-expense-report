@@ -150,6 +150,24 @@ function forceReingest() {
   runHourly();
 }
 
+/**
+ * One-time FULL RESET: trash every file in Inbox, Processed, AND Ignored.
+ * Use this to start completely fresh. Trash is recoverable for ~30 days.
+ */
+function clearAllInvoiceFolders() {
+  var inbox = DriveApp.getFolderById(CONFIG.INBOX_FOLDER_ID);
+  var count = trashAllIn_(inbox);
+  var parents = inbox.getParents();
+  if (parents.hasNext()) {
+    var siblings = parents.next().getFolders();
+    while (siblings.hasNext()) {
+      var f = siblings.next();
+      if (f.getId() !== CONFIG.INBOX_FOLDER_ID) count += trashAllIn_(f);
+    }
+  }
+  Logger.log('Trashed ' + count + ' file(s) across Inbox + Processed + Ignored.');
+}
+
 function trashAllIn_(folder) {
   const files = folder.getFiles();
   let count = 0;
