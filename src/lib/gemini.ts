@@ -59,35 +59,59 @@ async function generateWithRetry(content: Buffer, mimeType: string, prompt: stri
  * Classify AND extract in a single Gemini call — the free-tier daily request quota is
  * very small, so every file must cost exactly one request.
  */
-export async function analyzeDocument(
-  content: Buffer,
-  mimeType: string
-): Promise<DocumentAnalysis> {
-  const prompt = `You are an expense-document analyzer.
+const ANALYZE_PROMPT = `You are a strict expense-RECEIPT analyzer. Your job is to accept ONLY
+proof-of-payment documents and reject everything else.
 
-Step 1 — classify: is this file an invoice, receipt, bill, or other proof-of-payment / expense document?
-This includes: store receipts, ride/taxi receipts (Gett, Uber), utility bills, subscription invoices,
-insurance payment confirmations, and Hebrew documents (חשבונית, חשבונית מס, קבלה, אישור תשלום).
-Hebrew documents may have reversed/right-to-left text — that does not make them less valid.
-If the document shows a business/vendor name and a paid or due amount, it IS an expense document.
-Marketing emails, newsletters, product images, screenshots, and personal photos without payment
-details are NOT expense documents.
+ACCEPT (is_invoice = true) ONLY if the document is a receipt or tax invoice that evidences a
+PURCHASE the person actually paid for (or is being billed for), AND it shows BOTH a vendor/merchant
+name AND a concrete money amount that was charged or paid. Examples: store/restaurant receipts,
+ride/taxi receipts (Gett, Uber, Bolt), parking receipts, utility bills, subscription invoices,
+"חשבונית מס/קבלה", "קבלה", "אישור תשלום" with an amount.
 
-Step 2 — if it IS an expense document, extract its data. If not, use null for all fields.
+REJECT (is_invoice = false) — these are NOT receipts even though they look financial/official:
+- Insurance POLICIES or coverage/details documents ("פוליסה", "דף פרטי ביטוח", "policy", "insurance
+  details", terms & conditions) — a policy is not a payment receipt.
+- Pension / provident-fund / gemel statements or notices ("קרן פנסיה", "מקפת", "הודעה על הפסקת תשלום").
+- Bank/account statements, balance notices, schedules, contracts, forms, book/equipment lists,
+  reservation confirmations without a charged amount, shipping/delivery notices.
+- Anything that states it is "not a payment receipt" or "charge summary" / "this is not a receipt".
+- Marketing emails, newsletters, product images, screenshots, personal photos.
+
+When unsure, set is_invoice = false.
+
+CURRENCY — read the actual symbol/code on the document, do not assume:
+  ₪ or NIS or ש"ח or אג' -> "ILS"
+  $ or US$ or USD       -> "USD"
+  € or EUR              -> "EUR"
+  £ or GBP              -> "GBP"
+A Hebrew document is NOT automatically ILS — if the amount is shown in $ or €, use that.
+
+If is_invoice is false, set every other field to null.
 
 Return JSON only:
 {
   "is_invoice": boolean,
-  "confidence": number,        // 0.0-1.0 certainty of classification AND extraction
+  "confidence": number,           // 0.0-1.0 certainty
   "vendor": string | null,
-  "invoice_date": string | null,   // YYYY-MM-DD
+  "invoice_date": string | null,  // YYYY-MM-DD
   "total_amount": number | null,
-  "currency": string | null,       // 3-letter ISO code (ILS, USD, EUR, ...)
+  "currency": string | null,      // 3-letter ISO code
   "tax_amount": number | null,
   "invoice_number": string | null
 }
-Rules:
-- Do not invent values; use null if unknown`;
+Rules: do not invent values; use null if unknown.`;
 
-  return (await generateWithRetry(content, mimeType, prompt)) as DocumentAnalysis;
+export async function analyzeDocument(
+  content: Buffer,
+  mimeType: string
+): Promise<DocumentAnalysis> {
+  return (await generateWithRetry(content, mimeType, ANALYZE_PROMPT)) as DocumentAnalysis;
+}
+
+/** Same analysis for receipts that arrive as email body text (Uber, Metropark, etc.). */
+export async function analyzeText(text: string): Promise<DocumentAnalysis> {
+  const result = await model.generateContent([
+    ANALYZE_PROMPT + '\n\nDOCUMENT TEXT:\n' + text.slice(0, 20000),
+  ]);
+  return extractJSON(result.response.text()) as DocumentAnalysis;
 }
