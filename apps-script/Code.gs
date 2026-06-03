@@ -27,6 +27,8 @@
 const CONFIG = {
   INBOX_FOLDER_ID: '1eaCs2dx-ZxwZYGA6xaqNQrKXblO7xWQG',
   PROCESS_URL: 'https://simpleexpensereport.vercel.app/api/cron/process-invoices',
+  // Endpoint for receipts that arrive as email body text (Uber, Metropark, etc.)
+  PROCESS_TEXT_URL: 'https://simpleexpensereport.vercel.app/api/admin/process-text',
   CRON_SECRET: 'PASTE_CRON_SECRET_HERE', // value is in .env.local (gitignored) / Vercel env
 
   // Gmail labels.
@@ -183,7 +185,8 @@ function ingestLabeledThreads_(deadline) {
   const doneLabel = ensureLabel_(CONFIG.DONE_LABEL);
   const inbox = DriveApp.getFolderById(CONFIG.INBOX_FOLDER_ID);
 
-  const query = 'label:' + CONFIG.INGEST_LABEL + ' -label:' + CONFIG.DONE_LABEL + ' has:attachment';
+  // No "has:attachment" here — body-only receipts (Uber, Metropark) have no attachment.
+  const query = 'label:' + CONFIG.INGEST_LABEL + ' -label:' + CONFIG.DONE_LABEL;
   const threads = GmailApp.search(query, 0, CONFIG.MAX_THREADS_PER_RUN);
   let count = 0;
 
@@ -196,6 +199,7 @@ function ingestLabeledThreads_(deadline) {
     const messages = thread.getMessages();
     for (let m = 0; m < messages.length; m++) {
       const msg = messages[m];
+      let ingestedAttachment = false;
       // Real attachments only — inline images (signatures, logos, tracking pixels) are excluded.
       const atts = msg.getAttachments({ includeInlineImages: false, includeAttachments: true });
       for (let a = 0; a < atts.length; a++) {
@@ -208,16 +212,51 @@ function ingestLabeledThreads_(deadline) {
         const name = dateStr + '_' + safeSubject + '_' + att.getName();
         // Idempotency: never save the same file twice (e.g. re-labeled threads,
         // threads previously ingested by the old script).
-        if (alreadyIngested_(name)) continue;
+        if (alreadyIngested_(name)) { ingestedAttachment = true; continue; }
         // Force the correct content type so the processor recognizes octet-stream PDFs.
         inbox.createFile(att.copyBlob().setName(name).setContentType(mime));
         count++;
+        ingestedAttachment = true;
       }
+      // No usable attachment on this message → the receipt (if any) is in the body.
+      // Send the plain-text body to the analyzer; it rejects non-receipts itself.
+      if (!ingestedAttachment) count += sendBodyToAnalyzer_(msg);
     }
     // Mark the thread immediately so a timeout mid-run never causes re-ingestion.
     thread.addLabel(doneLabel);
   }
   return count;
+}
+
+// Send a message's plain-text body to the receipt analyzer (for Uber/Metropark-style
+// receipts delivered in the email body, not as attachments). Returns 1 if a row was
+// added, else 0. The endpoint classifies and ignores non-receipts.
+function sendBodyToAnalyzer_(msg) {
+  if (CONFIG.CRON_SECRET === 'PASTE_CRON_SECRET_HERE') return 0;
+  const body = (msg.getPlainBody() || '').slice(0, 18000);
+  if (body.replace(/\s/g, '').length < 40) return 0; // nothing meaningful to analyze
+  const dateStr = Utilities.formatDate(msg.getDate(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  const subject = (msg.getSubject() || 'no-subject');
+  const payload = {
+    text: 'Email subject: ' + subject + '\nReceived: ' + dateStr + '\n\n' + body,
+    file_name: dateStr + '_' + subject.replace(/[^\w֐-׿ .-]/g, '_').slice(0, 60) + '.eml',
+    source_link: 'https://mail.google.com/mail/u/0/#all/' + msg.getId(),
+  };
+  try {
+    const res = UrlFetchApp.fetch(CONFIG.PROCESS_TEXT_URL, {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { Authorization: 'Bearer ' + CONFIG.CRON_SECRET },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true,
+    });
+    const parsed = JSON.parse(res.getContentText());
+    Logger.log('Body analyze "' + subject + '": ' + (parsed.status || parsed.error));
+    return (parsed.status && parsed.status !== 'not_a_receipt') ? 1 : 0;
+  } catch (e) {
+    Logger.log('Body analyze failed for "' + subject + '": ' + e);
+    return 0;
+  }
 }
 
 // True if a file with this name already exists in the Inbox or in the sibling
