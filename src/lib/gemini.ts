@@ -62,22 +62,25 @@ async function generateWithRetry(content: Buffer, mimeType: string, prompt: stri
 const ANALYZE_PROMPT = `You are a strict expense-RECEIPT analyzer. Your job is to accept ONLY
 proof-of-payment documents and reject everything else.
 
-ACCEPT (is_invoice = true) ONLY if the document is a receipt or tax invoice that evidences a
-PURCHASE the person actually paid for (or is being billed for), AND it shows BOTH a vendor/merchant
-name AND a concrete money amount that was charged or paid. Examples: store/restaurant receipts,
-ride/taxi receipts (Gett, Uber, Bolt), parking receipts, utility bills, subscription invoices,
-"חשבונית מס/קבלה", "קבלה", "אישור תשלום" with an amount.
+The deciding test: does the document show a CONCRETE AMOUNT that the person was actually
+CHARGED or PAID for a purchase, together with a vendor/merchant name?
 
-REJECT (is_invoice = false) — these are NOT receipts even though they look financial/official:
-- Insurance POLICIES or coverage/details documents ("פוליסה", "דף פרטי ביטוח", "policy", "insurance
-  details", terms & conditions) — a policy is not a payment receipt.
-- Pension / provident-fund / gemel statements or notices ("קרן פנסיה", "מקפת", "הודעה על הפסקת תשלום").
+ACCEPT (is_invoice = true) if YES — it is a real expense. This INCLUDES: store/restaurant
+receipts, ride/taxi receipts (Gett, Uber, Bolt), parking & toll receipts, utility bills,
+subscription invoices, AND travel-insurance premiums / eSIM / booking charges — any purchase
+with a price. Hebrew docs ("חשבונית מס/קבלה", "קבלה", "אישור תשלום") count.
+
+REJECT (is_invoice = false) only if there is NO amount actually charged — i.e. the document is
+informational, not a purchase:
+- Insurance POLICY TERMS or coverage-details pages that show NO premium/price (just conditions).
+  (NOTE: if an insurance document DOES show a premium/cost that was charged, ACCEPT it.)
+- Pension / provident-fund / gemel statements or notices ("הודעה על הפסקת תשלום") — no purchase.
 - Bank/account statements, balance notices, schedules, contracts, forms, book/equipment lists,
-  reservation confirmations without a charged amount, shipping/delivery notices.
-- Anything that states it is "not a payment receipt" or "charge summary" / "this is not a receipt".
+  reservation confirmations with no price, shipping/delivery notices.
+- Documents that explicitly say "this is not a payment receipt" / "charge summary".
 - Marketing emails, newsletters, product images, screenshots, personal photos.
 
-When unsure, set is_invoice = false.
+When unsure whether a real amount was charged, set is_invoice = false.
 
 CURRENCY — read the actual symbol/code on the document, do not assume:
   ₪ or NIS or ש"ח or אג' -> "ILS"
