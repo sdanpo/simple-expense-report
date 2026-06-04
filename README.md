@@ -1,3 +1,16 @@
+
+## Architecture (all-in-Apps-Script, Vercel retired)
+
+The entire pipeline now runs inside Google Apps Script (`apps-script/Code.gs`) as you:
+Gmail read -> Drive Inbox -> **Gemini (called directly from Apps Script)** -> Sheet -> Processed/Ignored.
+No server, no service account, no CRON_SECRET. A phone photo-sync app feeds the Drive Inbox.
+
+**Vercel is no longer used** and can be deleted (project + the daily cron in `vercel.json`).
+The Next.js app under `src/` and the `/api/admin/*` endpoints are kept in the repo for reference only.
+
+Schedule: the Apps Script `runHourly` time trigger runs every hour and does both email ingestion
+and Inbox processing, bounded by a 5-minute time budget (Apps Script caps runs at 6 min).
+
 # Personal Invoice Automation — Status
 
 **Live app:** https://simpleexpensereport.vercel.app
