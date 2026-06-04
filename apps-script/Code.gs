@@ -26,6 +26,12 @@
 
 const CONFIG = {
   INBOX_FOLDER_ID: '1eaCs2dx-ZxwZYGA6xaqNQrKXblO7xWQG',
+  PROCESSED_FOLDER_ID: '1qRyuo0sPXpEQfZfeaQfVQfix20w0tGyr',
+  IGNORED_FOLDER_ID: '1PctH71brnmHySD1VSolcy4kek3ca4svW',
+  SHEET_ID: '1dSWFwyXy9wdXMYpjPsrbRCPDVZj8_bI2d4qauCkIAA8',
+  // Auto-clean: trash files in the Ignored folder older than this many days (junk —
+  // non-receipt photos, videos). Recoverable from Drive trash for ~30 days after.
+  IGNORED_RETENTION_DAYS: 3,
   PROCESS_URL: 'https://simpleexpensereport.vercel.app/api/cron/process-invoices',
   // Endpoint for receipts that arrive as email body text (Uber, Metropark, etc.)
   PROCESS_TEXT_URL: 'https://simpleexpensereport.vercel.app/api/admin/process-text',
@@ -92,6 +98,28 @@ function runHourly() {
   Logger.log('Ingested ' + ingested + ' attachment(s).');
   logToSheet_('ingest', 'hourly run: ingested ' + ingested + ' email item(s)');
   triggerProcessing_(deadline);
+  cleanupIgnored_(deadline);
+}
+
+// (a) ONGOING auto-clean: trash Ignored files older than IGNORED_RETENTION_DAYS.
+// Ignored holds non-receipt junk (personal photos, videos) — left alone it grows
+// forever. A short grace period lets you spot a misclassified receipt first; trashed
+// files are still recoverable from Drive trash for ~30 days.
+function cleanupIgnored_(deadline) {
+  const cutoff = Date.now() - CONFIG.IGNORED_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const files = DriveApp.getFolderById(CONFIG.IGNORED_FOLDER_ID).getFiles();
+  let n = 0;
+  while (files.hasNext()) {
+    if (deadline && Date.now() > deadline) break;
+    const f = files.next();
+    if (f.getDateCreated().getTime() < cutoff) { f.setTrashed(true); n++; }
+  }
+  if (n > 0) {
+    Logger.log('Auto-cleaned ' + n + ' old Ignored file(s).');
+    logToSheet_('cleanup', 'auto-trashed ' + n + ' Ignored file(s) older than ' +
+      CONFIG.IGNORED_RETENTION_DAYS + ' day(s)');
+  }
+  return n;
 }
 
 // Write one line to the unified Log tab in the Sheet (via Vercel), so the whole
@@ -167,6 +195,50 @@ function forceReingest() {
   threads.forEach(function (t) { t.removeLabel(done); });
   Logger.log('Cleared done-mark from ' + threads.length + ' thread(s). Re-ingesting...');
   runHourly();
+}
+
+/**
+ * (b) Run NOW: trash EVERYTHING in the Ignored folder, regardless of age.
+ * Use to clear the current junk immediately (the hourly cleanup only trashes files
+ * older than IGNORED_RETENTION_DAYS).
+ */
+function emptyIgnoredNow() {
+  const n = trashAllIn_(DriveApp.getFolderById(CONFIG.IGNORED_FOLDER_ID));
+  Logger.log('Trashed ' + n + ' file(s) from Ignored.');
+  logToSheet_('cleanup', 'emptied Ignored: trashed ' + n + ' file(s)');
+}
+
+/**
+ * (b) Run NOW: remove duplicate / orphan files from the Processed folder.
+ * Keeps only files that a Sheet row links to (the drive_link column); trashes the
+ * rest (e.g. the same receipt photographed several times). Safe: never trashes a
+ * file the Sheet points at, so no link breaks. Reusable any time.
+ */
+function cleanupProcessedOrphans() {
+  const keep = sheetLinkedFileIds_();
+  const files = DriveApp.getFolderById(CONFIG.PROCESSED_FOLDER_ID).getFiles();
+  let kept = 0, trashed = 0;
+  while (files.hasNext()) {
+    const f = files.next();
+    if (keep[f.getId()]) { kept++; }
+    else { f.setTrashed(true); trashed++; }
+  }
+  Logger.log('Processed cleanup: kept ' + kept + ' linked, trashed ' + trashed + ' orphan/duplicate.');
+  logToSheet_('cleanup', 'Processed dedup: kept ' + kept + ' linked, trashed ' + trashed + ' duplicate/orphan file(s)');
+}
+
+// Set of Drive file IDs referenced by the Sheet's drive_link column (Invoices tab).
+function sheetLinkedFileIds_() {
+  const ids = {};
+  const sh = SpreadsheetApp.openById(CONFIG.SHEET_ID).getSheetByName('Invoices');
+  if (!sh) return ids;
+  const values = sh.getDataRange().getValues();
+  for (let i = 1; i < values.length; i++) {
+    const link = String(values[i][9] || ''); // drive_link is column J (index 9)
+    const m = link.match(/\/d\/([A-Za-z0-9_-]+)/) || link.match(/[?&]id=([A-Za-z0-9_-]+)/);
+    if (m) ids[m[1]] = true;
+  }
+  return ids;
 }
 
 /**

@@ -135,6 +135,12 @@ requests/day, while `flash-lite` has its own larger quota pool.
   /Ignored    ← files Gemini judged not-a-receipt, or unsupported/too-large/corrupt.
 ```
 
+**Cleanup:** the **Inbox** is self-clearing (files move out as they're processed). The **Ignored**
+folder is auto-trashed by the Apps Script hourly run once files are older than
+`IGNORED_RETENTION_DAYS` (default 3; recoverable from Drive trash ~30 days). The **Processed**
+folder is kept as the receipt archive (the Sheet's `drive_link` points into it); run
+`cleanupProcessedOrphans` to drop duplicate/orphan files the Sheet doesn't reference.
+
 A file is only ever in one folder. The Sheet's `drive_link` column points back to the file.
 
 ---
