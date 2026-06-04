@@ -1,384 +1,331 @@
 /**
- * Invoice Automation — SELF-CONTAINED Google Apps Script pipeline.
+ * Invoice Automation — Gmail → Drive Inbox ingester + processor trigger.
  *
- * Runs entirely inside Google as YOU. No Vercel, no server, no service account.
- *   Gmail  -> read labeled receipt emails (attachments + body-only receipts)
- *   Drive  -> Inbox folder holds incoming files (also fed by a phone photo-sync app)
- *   Gemini -> classify + extract each receipt (one API call per file)
- *   Sheet  -> append a row; file moved to Processed / Ignored
+ * Runs AS YOU inside Google (no OAuth client, no consent screen, no verification).
+ *
+ * HOW INGESTION WORKS (label-based, no keyword guessing):
+ *   1. A Gmail FILTER (created by `setup`, or manually) applies the label
+ *      "AutoInvoiced" to incoming mail that looks like an invoice/receipt.
+ *      You can also apply the label by hand to any email you want ingested.
+ *   2. Every run, this script takes threads labeled AutoInvoiced that were not
+ *      ingested yet, saves their real attachments (PDF/images — no inline
+ *      signature logos / tracking pixels) into the Drive Inbox folder, and
+ *      marks the thread with "AutoInvoiced-done" so it is never re-ingested.
+ *   3. It then pings the Vercel processor until the Inbox is drained, within a
+ *      strict time budget so the script can NEVER exceed Apps Script's 6-minute
+ *      execution limit.
  *
  * SET UP (one time):
- *   1. Paste this file into script.google.com (replace everything), Save.
- *   2. Editor sidebar > Services (+) > Gmail > Add   (for the auto-label filters).
- *   3. Project Settings > show appsscript.json > paste apps-script/appsscript.json.
- *   4. Put your Gemini API key in CONFIG.GEMINI_API_KEY
- *      (free key at https://aistudio.google.com/apikey).
- *   5. Run `setup`, authorize. Done — it runs every hour on its own.
- *
- * One-time helpers you can run manually: backfillTrip, forceReingest,
- *   clearSheet, clearAllInvoiceFolders, resetInboxTrashAllFiles.
+ *   1. Paste this file into script.google.com (replace everything).
+ *   2. Enable the Gmail Advanced Service: Editor sidebar > Services (+) > Gmail > Add.
+ *   3. Set CONFIG.CRON_SECRET below (value is in Vercel → Settings → Env Vars).
+ *   4. Select function `setup` in the toolbar and click Run, authorize.
+ *   5. Optionally run `backfillRecentReceipts` once to ingest the last few days.
+ *   6. Done. It runs once per hour (Google schedules it at a fixed minute within the hour).
  */
 
 const CONFIG = {
-  // Drive folders
   INBOX_FOLDER_ID: '1eaCs2dx-ZxwZYGA6xaqNQrKXblO7xWQG',
-  PROCESSED_FOLDER_ID: '1qRyuo0sPXpEQfZfeaQfVQfix20w0tGyr',
-  IGNORED_FOLDER_ID: '1PctH71brnmHySD1VSolcy4kek3ca4svW',
+  PROCESS_URL: 'https://simpleexpensereport.vercel.app/api/cron/process-invoices',
+  // Endpoint for receipts that arrive as email body text (Uber, Metropark, etc.)
+  PROCESS_TEXT_URL: 'https://simpleexpensereport.vercel.app/api/admin/process-text',
+  CRON_SECRET: 'PASTE_CRON_SECRET_HERE', // value is in .env.local (gitignored) / Vercel env
 
-  // Google Sheet
-  SHEET_ID: '1dSWFwyXy9wdXMYpjPsrbRCPDVZj8_bI2d4qauCkIAA8',
-  SHEET_NAME: 'Invoices',
+  // Gmail labels.
+  // NOTE: do NOT reuse the old "invoice-ingested" label — a rogue Gmail filter was
+  // found applying it to ALL incoming mail, which silently excluded every new
+  // receipt from ingestion. setup() deletes that filter.
+  INGEST_LABEL: 'AutoInvoiced',          // applied by the Gmail filter (or by hand)
+  DONE_LABEL: 'AutoInvoiced-done',       // applied by this script after ingestion
+  LEGACY_DONE_LABEL: 'invoice-ingested', // old label; rogue filters for it get removed
 
-  // Gemini. 2.0-flash / 2.5-flash free tiers are ~20 req/day — use flash-lite.
-  GEMINI_API_KEY: 'PASTE_GEMINI_API_KEY_HERE',
-  GEMINI_MODEL: 'gemini-2.5-flash-lite',
-
-  // Gmail labels. Do NOT reuse the old "invoice-ingested" label — a rogue filter
-  // for it once labeled ALL incoming mail. setup() deletes that filter.
-  INGEST_LABEL: 'AutoInvoiced',
-  DONE_LABEL: 'AutoInvoiced-done',
-  LEGACY_DONE_LABEL: 'invoice-ingested',
+  // The Gmail filter created by setup(). Keywords match anywhere (subject, body,
+  // attachment names) — that is how receipts like Gett's ("receipt" only appears in
+  // the attachment) are caught. Junk stays out because ingestion now skips inline
+  // images / tiny files, and Gemini routes non-invoices to Ignored.
   FILTER_QUERY: 'has:attachment (invoice OR receipt OR "tax invoice" OR חשבונית OR קבלה)',
 
-  // Safety limits (Apps Script caps each run at 6 minutes)
+  // Safety limits
   MAX_THREADS_PER_RUN: 10,
-  MIN_ATTACHMENT_BYTES: 5 * 1024,
-  MAX_FILES_PER_RUN: 12,
-  MAX_FILE_BYTES: 15 * 1024 * 1024,   // Gemini inline-data request limit guard
-  TIME_BUDGET_MS: 5 * 60 * 1000,      // stop well before the 6-min limit
+  MIN_ATTACHMENT_BYTES: 5 * 1024,        // skip signature logos / tracking pixels
+  TIME_BUDGET_MS: 4 * 60 * 1000,         // hard stop well before the 6-min Apps Script limit
 };
 
-const HEADERS = ['vendor', 'invoice_date', 'total_amount', 'currency', 'tax_amount',
-  'invoice_number', 'confidence', 'status', 'file_name', 'drive_link', 'processed_at'];
-
-// MIME types Gemini accepts inline, normalized. Also resolved from file extension
-// (some senders attach PDFs as application/octet-stream).
-const GEMINI_TYPES = {
+// Real document types we ingest. Some senders attach PDFs as
+// "application/octet-stream", so we also accept by file extension.
+const ALLOWED_TYPES = {
   'application/pdf': 'application/pdf',
   'image/jpeg': 'image/jpeg', 'image/jpg': 'image/jpeg', 'image/png': 'image/png',
-  'image/webp': 'image/webp', 'image/heic': 'image/heic', 'image/heif': 'image/heif',
+  'image/heic': 'image/heic', 'image/heif': 'image/heif', 'image/webp': 'image/webp',
 };
 const EXTENSION_TYPES = {
   pdf: 'application/pdf', jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
-  webp: 'image/webp', heic: 'image/heic', heif: 'image/heif',
+  heic: 'image/heic', heif: 'image/heif', webp: 'image/webp',
 };
 
-const ANALYZE_PROMPT = `You are a strict expense-RECEIPT analyzer. Accept ONLY proof-of-payment documents.
-
-The deciding test: does the document show a CONCRETE AMOUNT that was actually CHARGED or PAID for a
-purchase, together with a vendor/merchant name?
-
-ACCEPT (is_invoice = true) if YES — a real expense. INCLUDES: store/restaurant receipts, ride/taxi
-receipts (Gett, Uber, Bolt), parking & toll receipts, utility bills, subscription invoices, AND
-travel-insurance premiums / eSIM / booking charges. Hebrew docs ("חשבונית מס/קבלה", "קבלה",
-"אישור תשלום") count. Hebrew/RTL text is still valid.
-
-REJECT (is_invoice = false) if there is NO amount actually charged — the document is informational:
-- Insurance POLICY TERMS / coverage-details pages with NO premium/price (just conditions).
-  (If an insurance document DOES show a premium/cost that was charged, ACCEPT it.)
-- Pension / provident-fund statements or notices ("הודעה על הפסקת תשלום").
-- Bank/account statements, schedules, contracts, forms, book/equipment lists, reservation
-  confirmations with no price, shipping notices.
-- Documents that say "this is not a payment receipt" / "charge summary".
-- Marketing, newsletters, product images, screenshots, personal photos.
-When unsure whether a real amount was charged, set is_invoice = false.
-
-CURRENCY — read the actual symbol, do not assume (a Hebrew doc is NOT automatically ILS):
-  ₪ / NIS / ש"ח -> "ILS";  $ / US$ -> "USD";  € -> "EUR";  £ -> "GBP".
-
-If is_invoice is false, set every other field to null.
-
-Return JSON only:
-{"is_invoice": boolean, "confidence": number, "vendor": string|null, "invoice_date": string|null,
- "total_amount": number|null, "currency": string|null, "tax_amount": number|null,
- "invoice_number": string|null}
-invoice_date format YYYY-MM-DD. Do not invent values; use null if unknown.`;
-
-/** Run ONCE: labels, Gmail filters, hourly trigger. */
+/** Run ONCE manually: authorizes scopes, creates labels + Gmail filter, installs the hourly trigger. */
 function setup() {
   ensureLabel_(CONFIG.INGEST_LABEL);
   ensureLabel_(CONFIG.DONE_LABEL);
   removeRogueFilters_();
   createGmailFilter_();
 
+  // Remove ALL existing triggers for this project to avoid duplicates / runaway schedules,
+  // then install a single hourly trigger.
   ScriptApp.getProjectTriggers().forEach(function (t) { ScriptApp.deleteTrigger(t); });
   ScriptApp.newTrigger('runHourly').timeBased().everyHours(1).create();
 
-  if (CONFIG.GEMINI_API_KEY === 'PASTE_GEMINI_API_KEY_HERE') {
-    Logger.log('WARNING: set CONFIG.GEMINI_API_KEY (https://aistudio.google.com/apikey) before processing.');
+  if (CONFIG.CRON_SECRET === 'PASTE_CRON_SECRET_HERE') {
+    Logger.log('WARNING: CONFIG.CRON_SECRET is not set. Ingestion will work, but the ' +
+      'processor cannot be triggered (401). Paste the real CRON_SECRET and save.');
   }
   Logger.log('Setup complete. Hourly trigger installed. Running once now...');
   runHourly();
 }
 
-/** Main hourly job: ingest labeled emails, then process the Inbox — within the time budget. */
+/** Main job: ingest labeled emails, then drain the processor — all within the time budget. */
 function runHourly() {
   const deadline = Date.now() + CONFIG.TIME_BUDGET_MS;
   const ingested = ingestLabeledThreads_(deadline);
-  Logger.log('Ingested ' + ingested + ' item(s) from email.');
-  const processed = processInbox_(deadline);
-  Logger.log('Processed ' + processed + ' file(s) from the Inbox.');
+  Logger.log('Ingested ' + ingested + ' attachment(s).');
+  triggerProcessing_(deadline);
 }
 
-// ---------- Gmail ingestion ----------
+/**
+ * One-time helper: label recent receipt-like emails (last 30 days) with AutoInvoiced
+ * so they get ingested. Gmail filters only apply to NEW mail, so run this once after
+ * setup to backfill, then it runs ingestion immediately.
+ * Covers: keyword-matching emails AND emails you sent to yourself with attachments
+ * (the "photograph a receipt and email it to myself" habit).
+ */
+function backfillRecentReceipts() {
+  const ingestLabel = ensureLabel_(CONFIG.INGEST_LABEL);
+  // Slightly broader than the ongoing filter (adds policy/insurance terms) — the
+  // Gemini classifier routes any non-expense documents to Ignored anyway.
+  const keywordQuery = CONFIG.FILTER_QUERY.replace(')', ' OR פוליסת OR ביטוח)');
+  const me = Session.getActiveUser().getEmail();
+  const selfQuery = 'from:' + me + ' to:' + me + ' has:attachment';
+  let labeled = 0;
+  [keywordQuery, selfQuery].forEach(function (q) {
+    const threads = GmailApp.search('newer_than:30d -label:' + CONFIG.DONE_LABEL + ' ' + q, 0, 100);
+    threads.forEach(function (t) { t.addLabel(ingestLabel); });
+    labeled += threads.length;
+  });
+  Logger.log('Labeled ' + labeled + ' thread(s) with ' + CONFIG.INGEST_LABEL +
+    '. Running ingestion now...');
+  runHourly();
+}
+
+/**
+ * One-time helper: move EVERYTHING currently in the Drive Inbox AND Ignored folders
+ * to the trash. Use this to clear the junk files the old (pre-fix) script ingested,
+ * including real receipts that were misclassified into Ignored.
+ * Safe: every file was extracted from a Gmail message that still exists, and real
+ * receipts get re-ingested cleanly by backfillRecentReceipts(). Trash is recoverable
+ * for 30 days. The Processed folder (files already in the Sheet) is NOT touched.
+ */
+function resetInboxTrashAllFiles() {
+  const inbox = DriveApp.getFolderById(CONFIG.INBOX_FOLDER_ID);
+  let count = trashAllIn_(inbox);
+  // Also clear sibling "Ignored" folder — junk plus possible false negatives.
+  const parents = inbox.getParents();
+  if (parents.hasNext()) {
+    const siblings = parents.next().getFolders();
+    while (siblings.hasNext()) {
+      const folder = siblings.next();
+      if (folder.getName() === 'Ignored') count += trashAllIn_(folder);
+    }
+  }
+  Logger.log('Moved ' + count + ' file(s) to the trash.');
+}
+
+/**
+ * One-time helper: un-mark recently ingested threads so any attachments missing from
+ * Drive get re-ingested. Safe — the filename dedup skips files that already exist in
+ * Inbox/Processed/Ignored, so nothing gets duplicated.
+ */
+function forceReingest() {
+  const done = ensureLabel_(CONFIG.DONE_LABEL);
+  const threads = GmailApp.search('label:' + CONFIG.INGEST_LABEL + ' newer_than:7d', 0, 50);
+  threads.forEach(function (t) { t.removeLabel(done); });
+  Logger.log('Cleared done-mark from ' + threads.length + ' thread(s). Re-ingesting...');
+  runHourly();
+}
+
+/**
+ * One-time FULL RESET: trash every file in Inbox, Processed, AND Ignored.
+ * Use this to start completely fresh. Trash is recoverable for ~30 days.
+ */
+function clearAllInvoiceFolders() {
+  var inbox = DriveApp.getFolderById(CONFIG.INBOX_FOLDER_ID);
+  var count = trashAllIn_(inbox);
+  var parents = inbox.getParents();
+  if (parents.hasNext()) {
+    var siblings = parents.next().getFolders();
+    while (siblings.hasNext()) {
+      var f = siblings.next();
+      if (f.getId() !== CONFIG.INBOX_FOLDER_ID) count += trashAllIn_(f);
+    }
+  }
+  Logger.log('Trashed ' + count + ' file(s) across Inbox + Processed + Ignored.');
+}
+
+function trashAllIn_(folder) {
+  const files = folder.getFiles();
+  let count = 0;
+  while (files.hasNext()) {
+    files.next().setTrashed(true);
+    count++;
+  }
+  return count;
+}
 
 function ingestLabeledThreads_(deadline) {
   const ingestLabel = ensureLabel_(CONFIG.INGEST_LABEL);
   const doneLabel = ensureLabel_(CONFIG.DONE_LABEL);
   const inbox = DriveApp.getFolderById(CONFIG.INBOX_FOLDER_ID);
 
+  // No "has:attachment" here — body-only receipts (Uber, Metropark) have no attachment.
   const query = 'label:' + CONFIG.INGEST_LABEL + ' -label:' + CONFIG.DONE_LABEL;
   const threads = GmailApp.search(query, 0, CONFIG.MAX_THREADS_PER_RUN);
   let count = 0;
 
   for (let t = 0; t < threads.length; t++) {
-    if (Date.now() > deadline) { Logger.log('Budget reached during ingestion.'); break; }
+    if (Date.now() > deadline) {
+      Logger.log('Time budget reached during ingestion; remaining threads will be picked up next run.');
+      break;
+    }
     const thread = threads[t];
     const messages = thread.getMessages();
     for (let m = 0; m < messages.length; m++) {
       const msg = messages[m];
       let ingestedAttachment = false;
+      // Real attachments only — inline images (signatures, logos, tracking pixels) are excluded.
       const atts = msg.getAttachments({ includeInlineImages: false, includeAttachments: true });
       for (let a = 0; a < atts.length; a++) {
         const att = atts[a];
-        const mime = resolveMimeType_(att.getContentType(), att.getName());
+        const mime = resolveMimeType_(att);
         if (!mime) continue;
         if (att.getSize() < CONFIG.MIN_ATTACHMENT_BYTES) continue;
-        const name = fileNameFor_(msg, att.getName());
+        const dateStr = Utilities.formatDate(msg.getDate(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+        const safeSubject = (msg.getSubject() || 'no-subject').replace(/[^\w֐-׿ .-]/g, '_').slice(0, 60);
+        const name = dateStr + '_' + safeSubject + '_' + att.getName();
+        // Idempotency: never save the same file twice (e.g. re-labeled threads,
+        // threads previously ingested by the old script).
         if (alreadyIngested_(name)) { ingestedAttachment = true; continue; }
+        // Force the correct content type so the processor recognizes octet-stream PDFs.
         inbox.createFile(att.copyBlob().setName(name).setContentType(mime));
         count++;
         ingestedAttachment = true;
       }
-      // No usable attachment → the receipt (if any) is in the body text.
-      if (!ingestedAttachment) count += analyzeBodyAndRecord_(msg);
+      // No usable attachment on this message → the receipt (if any) is in the body.
+      // Send the plain-text body to the analyzer; it rejects non-receipts itself.
+      if (!ingestedAttachment) count += sendBodyToAnalyzer_(msg);
     }
+    // Mark the thread immediately so a timeout mid-run never causes re-ingestion.
     thread.addLabel(doneLabel);
   }
   return count;
 }
 
-// Analyze a message's body text for a receipt (Uber, Metropark, etc.) and record it.
-function analyzeBodyAndRecord_(msg) {
-  if (CONFIG.GEMINI_API_KEY === 'PASTE_GEMINI_API_KEY_HERE') return 0;
+// Send a message's plain-text body to the receipt analyzer (for Uber/Metropark-style
+// receipts delivered in the email body, not as attachments). Returns 1 if a row was
+// added, else 0. The endpoint classifies and ignores non-receipts.
+function sendBodyToAnalyzer_(msg) {
+  if (CONFIG.CRON_SECRET === 'PASTE_CRON_SECRET_HERE') return 0;
   const body = (msg.getPlainBody() || '').slice(0, 18000);
-  if (body.replace(/\s/g, '').length < 40) return 0;
-  const subject = msg.getSubject() || 'no-subject';
-  let analysis;
-  try {
-    analysis = callGemini_([{ text: ANALYZE_PROMPT + '\n\nDOCUMENT TEXT:\nEmail subject: ' + subject + '\n\n' + body }]);
-  } catch (e) { Logger.log('Body analyze failed "' + subject + '": ' + e); return 0; }
-  if (!analysis.is_invoice || (analysis.confidence || 0) < 0.5) {
-    Logger.log('Body not a receipt: ' + subject);
-    return 0;
-  }
+  if (body.replace(/\s/g, '').length < 40) return 0; // nothing meaningful to analyze
   const dateStr = Utilities.formatDate(msg.getDate(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
-  appendRow_(buildRow_(analysis, dateStr + '_' + safe_(subject) + '.eml',
-    'https://mail.google.com/mail/u/0/#all/' + msg.getId()));
-  Logger.log('Body receipt: ' + subject + ' -> ' + analysis.vendor + ' ' + analysis.total_amount + ' ' + analysis.currency);
-  return 1;
-}
-
-// ---------- Inbox processing (was the Vercel endpoint) ----------
-
-function processInbox_(deadline) {
-  if (CONFIG.GEMINI_API_KEY === 'PASTE_GEMINI_API_KEY_HERE') {
-    Logger.log('Skipping processing: CONFIG.GEMINI_API_KEY not set.');
-    return 0;
-  }
-  // Snapshot IDs first (we move files out of the folder while iterating).
-  const it = DriveApp.getFolderById(CONFIG.INBOX_FOLDER_ID).getFiles();
-  const ids = [];
-  while (it.hasNext()) ids.push(it.next().getId());
-
-  let done = 0;
-  for (let i = 0; i < ids.length; i++) {
-    if (done >= CONFIG.MAX_FILES_PER_RUN || Date.now() > deadline) break;
-    const file = DriveApp.getFileById(ids[i]);
-    done++;
-    try { processOneFile_(file); }
-    catch (e) { Logger.log('Error processing ' + file.getName() + ': ' + e); }
-  }
-  return done;
-}
-
-function processOneFile_(file) {
-  const name = file.getName();
-  const mime = resolveMimeType_(file.getMimeType(), name);
-  if (!mime) { moveFile_(file, CONFIG.IGNORED_FOLDER_ID); Logger.log('ignored (unsupported): ' + name); return; }
-  if (file.getSize() > CONFIG.MAX_FILE_BYTES) {
-    moveFile_(file, CONFIG.IGNORED_FOLDER_ID);
-    Logger.log('ignored (too large for Gemini): ' + name);
-    return;
-  }
-  const b64 = Utilities.base64Encode(file.getBlob().getBytes());
-  const analysis = callGemini_([{ text: ANALYZE_PROMPT }, { inline_data: { mime_type: mime, data: b64 } }]);
-  if (!analysis.is_invoice || (analysis.confidence || 0) < 0.5) {
-    moveFile_(file, CONFIG.IGNORED_FOLDER_ID);
-    Logger.log('ignored (not a receipt): ' + name);
-    return;
-  }
-  appendRow_(buildRow_(analysis, name, file.getUrl()));
-  moveFile_(file, CONFIG.PROCESSED_FOLDER_ID);
-  Logger.log('approved: ' + name + ' -> ' + analysis.vendor + ' ' + analysis.total_amount + ' ' + analysis.currency);
-}
-
-// ---------- Gemini ----------
-
-function callGemini_(parts) {
-  const url = 'https://generativelanguage.googleapis.com/v1beta/models/' +
-    CONFIG.GEMINI_MODEL + ':generateContent?key=' + CONFIG.GEMINI_API_KEY;
-  const payload = JSON.stringify({ contents: [{ parts: parts }] });
-  let lastErr = '';
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const res = UrlFetchApp.fetch(url, {
-      method: 'post', contentType: 'application/json', payload: payload, muteHttpExceptions: true,
-    });
-    const code = res.getResponseCode();
-    const text = res.getContentText();
-    if (code === 200) {
-      const data = JSON.parse(text);
-      const out = data.candidates && data.candidates[0] && data.candidates[0].content &&
-        data.candidates[0].content.parts[0].text;
-      return extractJson_(out);
-    }
-    lastErr = code + ': ' + text.slice(0, 200);
-    if (code === 429 || code >= 500) { Utilities.sleep(2000 * (attempt + 1)); continue; }
-    break;
-  }
-  throw new Error('Gemini ' + lastErr);
-}
-
-function extractJson_(text) {
-  if (!text) throw new Error('empty Gemini response');
-  const m = text.match(/\{[\s\S]*\}/);
-  if (!m) throw new Error('no JSON in Gemini response');
-  return JSON.parse(m[0]);
-}
-
-// ---------- Sheet ----------
-
-function ensureSheet_() {
-  const ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
-  let sh = ss.getSheetByName(CONFIG.SHEET_NAME);
-  if (!sh) sh = ss.insertSheet(CONFIG.SHEET_NAME);
-  if (sh.getLastRow() === 0) sh.appendRow(HEADERS);
-  return sh;
-}
-
-function buildRow_(a, fileName, link) {
-  const auto = a.vendor && a.invoice_date && a.total_amount != null && (a.confidence || 0) >= 0.8;
-  return {
-    vendor: a.vendor || '', invoice_date: a.invoice_date || '',
-    total_amount: (a.total_amount == null ? '' : a.total_amount),
-    currency: a.currency || '', tax_amount: (a.tax_amount == null ? '' : a.tax_amount),
-    invoice_number: a.invoice_number || '', confidence: (a.confidence == null ? '' : a.confidence),
-    status: auto ? 'Approved' : 'Needs Review', file_name: fileName, drive_link: link || '',
+  const subject = (msg.getSubject() || 'no-subject');
+  const payload = {
+    text: 'Email subject: ' + subject + '\nReceived: ' + dateStr + '\n\n' + body,
+    file_name: dateStr + '_' + subject.replace(/[^\w֐-׿ .-]/g, '_').slice(0, 60) + '.eml',
+    source_link: 'https://mail.google.com/mail/u/0/#all/' + msg.getId(),
   };
-}
-
-function appendRow_(r) {
-  ensureSheet_().appendRow([r.vendor, r.invoice_date, r.total_amount, r.currency, r.tax_amount,
-    r.invoice_number, r.confidence, r.status, r.file_name, r.drive_link, new Date().toISOString()]);
-}
-
-// ---------- Drive helpers ----------
-
-function moveFile_(file, destId) {
-  const dest = DriveApp.getFolderById(destId);
-  dest.addFile(file);
-  const parents = file.getParents();
-  while (parents.hasNext()) {
-    const p = parents.next();
-    if (p.getId() !== destId) p.removeFile(file);
+  try {
+    const res = UrlFetchApp.fetch(CONFIG.PROCESS_TEXT_URL, {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { Authorization: 'Bearer ' + CONFIG.CRON_SECRET },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true,
+    });
+    const parsed = JSON.parse(res.getContentText());
+    Logger.log('Body analyze "' + subject + '": ' + (parsed.status || parsed.error));
+    return (parsed.status && parsed.status !== 'not_a_receipt') ? 1 : 0;
+  } catch (e) {
+    Logger.log('Body analyze failed for "' + subject + '": ' + e);
+    return 0;
   }
 }
 
-function resolveMimeType_(declared, name) {
-  const d = (declared || '').toLowerCase();
-  if (GEMINI_TYPES[d]) return GEMINI_TYPES[d];
-  const lower = (name || '').toLowerCase();
-  const ext = lower.indexOf('.') === -1 ? '' : lower.split('.').pop();
-  return EXTENSION_TYPES[ext] || null;
-}
-
-function fileNameFor_(msg, attName) {
-  const dateStr = Utilities.formatDate(msg.getDate(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
-  return dateStr + '_' + safe_(msg.getSubject()) + '_' + attName;
-}
-
-function safe_(s) { return (s || 'no-subject').replace(/[^\w֐-׿ .-]/g, '_').slice(0, 60); }
-
+// True if a file with this name already exists in the Inbox or in the sibling
+// Processed/Ignored folders (i.e. it was ingested before, possibly already handled).
 function alreadyIngested_(name) {
   const inbox = DriveApp.getFolderById(CONFIG.INBOX_FOLDER_ID);
   if (inbox.getFilesByName(name).hasNext()) return true;
-  const ids = [CONFIG.PROCESSED_FOLDER_ID, CONFIG.IGNORED_FOLDER_ID];
-  for (let i = 0; i < ids.length; i++) {
-    if (DriveApp.getFolderById(ids[i]).getFilesByName(name).hasNext()) return true;
+  const parents = inbox.getParents();
+  if (parents.hasNext()) {
+    const root = parents.next();
+    const siblings = root.getFolders();
+    while (siblings.hasNext()) {
+      const folder = siblings.next();
+      if (folder.getId() !== CONFIG.INBOX_FOLDER_ID && folder.getFilesByName(name).hasNext()) return true;
+    }
   }
   return false;
+}
+
+// Returns the normalized MIME type for an attachment, or null if it is not a
+// document type we ingest. Falls back to the file extension because some senders
+// attach PDFs as application/octet-stream.
+function resolveMimeType_(att) {
+  const declared = (att.getContentType() || '').toLowerCase();
+  if (ALLOWED_TYPES[declared]) return ALLOWED_TYPES[declared];
+  const name = (att.getName() || '').toLowerCase();
+  const ext = name.indexOf('.') === -1 ? '' : name.split('.').pop();
+  return EXTENSION_TYPES[ext] || null;
+}
+
+// Ping the processor until the Inbox is drained (the endpoint processes a bounded
+// batch per call and reports `remaining`). Stops at the time budget so the script
+// never exceeds the Apps Script execution limit — leftovers are picked up next hour.
+function triggerProcessing_(deadline) {
+  if (CONFIG.CRON_SECRET === 'PASTE_CRON_SECRET_HERE') {
+    Logger.log('Skipping processing trigger: CONFIG.CRON_SECRET is not set.');
+    return;
+  }
+  while (Date.now() < deadline) {
+    let parsed;
+    try {
+      const res = UrlFetchApp.fetch(CONFIG.PROCESS_URL, {
+        method: 'get',
+        headers: { Authorization: 'Bearer ' + CONFIG.CRON_SECRET },
+        muteHttpExceptions: true,
+      });
+      const code = res.getResponseCode();
+      const body = res.getContentText();
+      Logger.log('Process ping: ' + code + ' ' + body.slice(0, 500));
+      if (code !== 200) break;
+      parsed = JSON.parse(body);
+    } catch (e) {
+      Logger.log('Process trigger failed: ' + e);
+      break;
+    }
+    // Stop when the Inbox is drained or the endpoint made no progress.
+    if (!parsed || parsed.remaining === 0 || parsed.processed === 0) break;
+  }
 }
 
 function ensureLabel_(name) {
   return GmailApp.getUserLabelByName(name) || GmailApp.createLabel(name);
 }
 
-// ---------- One-time helpers ----------
+// ---------- Gmail filter management (requires the Gmail Advanced Service) ----------
 
-/** Clear all data rows from the Sheet (keep header). */
-function clearSheet() {
-  const sh = ensureSheet_();
-  const last = sh.getLastRow();
-  if (last > 1) sh.deleteRows(2, last - 1);
-  Logger.log('Cleared ' + Math.max(0, last - 1) + ' data row(s).');
-}
-
-/** Trash every file in Inbox + Processed + Ignored. Recoverable for ~30 days. */
-function clearAllInvoiceFolders() {
-  let n = trashAllIn_(DriveApp.getFolderById(CONFIG.INBOX_FOLDER_ID));
-  n += trashAllIn_(DriveApp.getFolderById(CONFIG.PROCESSED_FOLDER_ID));
-  n += trashAllIn_(DriveApp.getFolderById(CONFIG.IGNORED_FOLDER_ID));
-  Logger.log('Trashed ' + n + ' file(s) across all folders.');
-}
-
-/** Trash everything in the Inbox only. */
-function resetInboxTrashAllFiles() {
-  Logger.log('Trashed ' + trashAllIn_(DriveApp.getFolderById(CONFIG.INBOX_FOLDER_ID)) + ' Inbox file(s).');
-}
-
-function trashAllIn_(folder) {
-  const files = folder.getFiles();
-  let count = 0;
-  while (files.hasNext()) { files.next().setTrashed(true); count++; }
-  return count;
-}
-
-/** Label + ingest receipt-like emails from the last 30 days (incl. self-sent attachments). */
-function backfillRecentReceipts() {
-  const ingest = ensureLabel_(CONFIG.INGEST_LABEL);
-  const kw = CONFIG.FILTER_QUERY.replace(')', ' OR פוליסת OR ביטוח)');
-  const me = Session.getActiveUser().getEmail();
-  let labeled = 0;
-  [kw, 'from:' + me + ' to:' + me + ' has:attachment'].forEach(function (q) {
-    const threads = GmailApp.search('newer_than:30d -label:' + CONFIG.DONE_LABEL + ' ' + q, 0, 100);
-    threads.forEach(function (t) { t.addLabel(ingest); });
-    labeled += threads.length;
-  });
-  Logger.log('Labeled ' + labeled + ' thread(s). Running now...');
-  runHourly();
-}
-
-/** Un-mark recently ingested threads so missing attachments/body receipts re-process. */
-function forceReingest() {
-  const done = ensureLabel_(CONFIG.DONE_LABEL);
-  const threads = GmailApp.search('label:' + CONFIG.INGEST_LABEL + ' newer_than:7d', 0, 50);
-  threads.forEach(function (t) { t.removeLabel(done); });
-  Logger.log('Cleared done-mark from ' + threads.length + ' thread(s). Running now...');
-  runHourly();
-}
-
-// ---------- Gmail filter management (needs the Gmail Advanced Service) ----------
-
+// Delete any filter that auto-applies the legacy "invoice-ingested" label.
+// One such rogue filter was labeling ALL incoming mail, which excluded every
+// new receipt from ingestion.
 function removeRogueFilters_() {
   try {
     const labels = Gmail.Users.Labels.list('me').labels || [];
@@ -389,29 +336,51 @@ function removeRogueFilters_() {
       const adds = (f.action && f.action.addLabelIds) || [];
       if (adds.indexOf(legacy.id) !== -1) {
         Gmail.Users.Settings.Filters.remove('me', f.id);
-        Logger.log('Removed rogue filter applying "' + CONFIG.LEGACY_DONE_LABEL + '".');
+        Logger.log('Removed rogue Gmail filter that applied "' + CONFIG.LEGACY_DONE_LABEL + '" to incoming mail.');
       }
     });
   } catch (e) {
-    Logger.log('Could not check rogue filters (' + e + '). Enable the Gmail Advanced Service and re-run setup.');
+    Logger.log('Could not check/remove rogue filters (' + e + '). If the Gmail Advanced Service is not ' +
+      'enabled: Editor sidebar > Services (+) > Gmail > Add, then re-run setup. Also check ' +
+      'Gmail > Settings > Filters and DELETE any filter that applies the "' +
+      CONFIG.LEGACY_DONE_LABEL + '" label.');
   }
 }
 
+// Create the Gmail filters that auto-apply the AutoInvoiced label:
+//   1. Incoming invoice/receipt emails (keyword match)
+//   2. Emails you send to yourself with an attachment (photographed receipts)
 function createGmailFilter_() {
   const me = Session.getActiveUser().getEmail();
-  const wanted = [CONFIG.FILTER_QUERY, 'from:' + me + ' to:' + me + ' has:attachment'];
+  const wantedQueries = [
+    CONFIG.FILTER_QUERY,
+    'from:' + me + ' to:' + me + ' has:attachment',
+  ];
   try {
     const labels = Gmail.Users.Labels.list('me').labels || [];
     const label = labels.filter(function (l) { return l.name === CONFIG.INGEST_LABEL; })[0];
     if (!label) throw new Error('Label not found: ' + CONFIG.INGEST_LABEL);
+
     const filters = (Gmail.Users.Settings.Filters.list('me').filter) || [];
-    wanted.forEach(function (q) {
-      if (filters.some(function (f) { return f.criteria && f.criteria.query === q; })) return;
-      Gmail.Users.Settings.Filters.create({ criteria: { query: q }, action: { addLabelIds: [label.id] } }, 'me');
-      Logger.log('Gmail filter created: ' + q + ' -> ' + CONFIG.INGEST_LABEL);
+    wantedQueries.forEach(function (query) {
+      const exists = filters.some(function (f) {
+        return f.criteria && f.criteria.query === query;
+      });
+      if (exists) {
+        Logger.log('Gmail filter already exists: ' + query);
+        return;
+      }
+      Gmail.Users.Settings.Filters.create({
+        criteria: { query: query },
+        action: { addLabelIds: [label.id] },
+      }, 'me');
+      Logger.log('Gmail filter created: ' + query + ' -> ' + CONFIG.INGEST_LABEL);
     });
   } catch (e) {
-    Logger.log('Could not create filters automatically (' + e + '). Enable the Gmail Advanced Service ' +
-      '(Services + > Gmail) and re-run setup, or create them by hand in Gmail Settings > Filters.');
+    Logger.log('Could not create the Gmail filters automatically (' + e + ').\n' +
+      'Either enable the Gmail Advanced Service (Editor sidebar > Services + > Gmail) and re-run setup,\n' +
+      'or create them manually: Gmail > Settings > Filters > Create new filter >\n' +
+      '  Has the words: ' + wantedQueries.join('\n  Has the words: ') + '\n' +
+      '  > Create filter > Apply the label: ' + CONFIG.INGEST_LABEL);
   }
 }
