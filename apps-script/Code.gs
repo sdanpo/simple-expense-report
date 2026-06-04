@@ -29,6 +29,8 @@ const CONFIG = {
   PROCESS_URL: 'https://simpleexpensereport.vercel.app/api/cron/process-invoices',
   // Endpoint for receipts that arrive as email body text (Uber, Metropark, etc.)
   PROCESS_TEXT_URL: 'https://simpleexpensereport.vercel.app/api/admin/process-text',
+  // Unified activity log — writes to the "Log" tab in the Sheet (one place to debug).
+  LOG_URL: 'https://simpleexpensereport.vercel.app/api/admin/log',
   CRON_SECRET: 'PASTE_CRON_SECRET_HERE', // value is in .env.local (gitignored) / Vercel env
 
   // Gmail labels.
@@ -88,7 +90,22 @@ function runHourly() {
   const deadline = Date.now() + CONFIG.TIME_BUDGET_MS;
   const ingested = ingestLabeledThreads_(deadline);
   Logger.log('Ingested ' + ingested + ' attachment(s).');
+  logToSheet_('ingest', 'hourly run: ingested ' + ingested + ' email item(s)');
   triggerProcessing_(deadline);
+}
+
+// Write one line to the unified Log tab in the Sheet (via Vercel), so the whole
+// system's activity is visible in one place. Never throws.
+function logToSheet_(event, detail) {
+  if (CONFIG.CRON_SECRET === 'PASTE_CRON_SECRET_HERE') return;
+  try {
+    UrlFetchApp.fetch(CONFIG.LOG_URL, {
+      method: 'post', contentType: 'application/json',
+      headers: { Authorization: 'Bearer ' + CONFIG.CRON_SECRET },
+      payload: JSON.stringify({ source: 'apps-script', event: event, detail: detail }),
+      muteHttpExceptions: true,
+    });
+  } catch (e) { Logger.log('logToSheet failed: ' + e); }
 }
 
 /**

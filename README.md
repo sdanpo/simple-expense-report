@@ -251,7 +251,29 @@ own).
 
 ---
 
-## 11. Known issues & design decisions
+## 11. Logs & debugging — one place
+
+There is a **single activity log: a `Log` tab in the same Google Sheet.** Both halves of the system
+write to it, so you never open the Apps Script editor or the Vercel dashboard to see what happened:
+
+```
+timestamp           | source      | event        | detail
+2026-06-04 18:05:11 | apps-script | ingest       | hourly run: ingested 3 email item(s)
+2026-06-04 18:05:14 | vercel      | approved     | IMG_x.jpg → approved: El Corte Inglés 1.86 EUR
+2026-06-04 18:05:18 | vercel      | ignored      | IMG_y.jpg → ignored (not a receipt)
+2026-06-04 18:05:22 | vercel      | error        | IMG_z.jpg → Gemini quota/rate-limit (429), will retry
+```
+
+- **"Did it run?"** → look for an `apps-script / ingest` line in the last hour.
+- **"Why didn't my receipt show up?"** → find its filename: `ignored (not a receipt)` = Gemini didn't
+  see it as a receipt; `error … will retry` = transient (quota), it'll reappear; no line at all = it
+  never reached the Inbox (sync/label problem — see below).
+
+Implementation: Vercel writes via `appendLog()` (`src/lib/sheets.ts`); Apps Script POSTs to
+`/api/admin/log`. The tab is auto-created and trimmed to the newest ~1000 rows. Raw runtime logs still
+exist (Apps Script **Executions**, Vercel **Logs**) but are only needed for deep stack traces.
+
+## 12. Known issues & design decisions
 
 - **Photo-sync floods the Inbox.** Pointing a sync app at your *whole camera roll* uploads every
   personal photo and video, which all get run through Gemini (quota + noise) and can produce false
@@ -275,7 +297,7 @@ own).
 
 ---
 
-## 12. Repo layout
+## 13. Repo layout
 
 ```
 apps-script/

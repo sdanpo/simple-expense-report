@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { analyzeText } from '@/lib/gemini';
-import { appendRow, ensureSheetHeaders } from '@/lib/sheets';
+import { appendRow, ensureSheetHeaders, appendLog } from '@/lib/sheets';
 import type { SheetRow, InvoiceStatus } from '@/lib/types';
 
 export const maxDuration = 60;
@@ -32,6 +32,8 @@ export async function POST(req: NextRequest) {
     await ensureSheetHeaders();
     const invoice = await analyzeText(body.text);
     if (!invoice.is_invoice || invoice.confidence < 0.5) {
+      await appendLog([{ source: 'vercel', event: 'ignored',
+        detail: `${body.file_name ?? 'email body'} → email body not a receipt` }]);
       return NextResponse.json({ status: 'not_a_receipt', analysis: invoice });
     }
 
@@ -57,6 +59,10 @@ export async function POST(req: NextRequest) {
     };
     await appendRow(row);
 
+    await appendLog([{
+      source: 'vercel', event: status === 'Approved' ? 'approved' : 'needs_review',
+      detail: `${body.file_name ?? 'email body'} → email-body receipt: ${invoice.vendor ?? '?'} ${invoice.total_amount ?? ''} ${invoice.currency ?? ''}`.trim(),
+    }]);
     return NextResponse.json({ status: status.toLowerCase().replace(' ', '_'), row });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

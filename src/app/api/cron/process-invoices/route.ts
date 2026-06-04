@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { listInboxFiles, downloadFile, moveFile } from '@/lib/drive';
 import { analyzeDocument, isSupportedMimeType } from '@/lib/gemini';
-import { appendRow, ensureSheetHeaders } from '@/lib/sheets';
+import { appendRow, ensureSheetHeaders, appendLog, type LogEntry } from '@/lib/sheets';
 import type { SheetRow, InvoiceStatus } from '@/lib/types';
 
 export const maxDuration = 300;
@@ -23,19 +23,24 @@ export async function GET(req: NextRequest) {
     const allFiles = await listInboxFiles();
     const batch = allFiles.slice(0, MAX_FILES_PER_RUN);
 
+    const logs: LogEntry[] = [];
     for (const file of batch) {
       try {
         const result = await processFile(file);
         results.push(result);
+        logs.push(logFor(result));
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         console.error(`Error processing ${file.name}:`, message);
         results.push({ file: file.name, status: 'error', error: message });
+        logs.push({ source: 'vercel', event: 'error', detail: `${file.name} → ${shortError(message)}` });
         // Leave file in Inbox — will retry next cycle
       }
     }
 
     const remaining = Math.max(0, allFiles.length - batch.length);
+    // Write the human-readable outcome of this run to the Log tab in the Sheet.
+    await appendLog(logs);
     return NextResponse.json({ processed: results.length, remaining, results });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -89,7 +94,8 @@ async function processFile(file: { id: string; name: string; mimeType: string; w
     };
     await appendRow(row);
 
-    return { file: file.name, status: status.toLowerCase().replace(' ', '_') };
+    const summary = `${invoice.vendor ?? '?'} ${invoice.total_amount ?? ''} ${invoice.currency ?? ''}`.trim();
+    return { file: file.name, status: status.toLowerCase().replace(' ', '_'), summary };
   } catch (err) {
     // Permanent input errors (corrupted/unreadable file) can never succeed —
     // route to Ignored instead of retrying forever.
@@ -101,6 +107,28 @@ async function processFile(file: { id: string; name: string; mimeType: string; w
     await moveFile(file.id, process.env.GOOGLE_DRIVE_INBOX_ID!).catch(() => {});
     throw err;
   }
+}
+
+// Turn a processFile result into a one-line Log entry a human can read.
+function logFor(r: { file: string; status: string; summary?: string }): LogEntry {
+  const map: Record<string, string> = {
+    approved: 'approved',
+    needs_review: 'needs review',
+    ignored_not_invoice: 'ignored (not a receipt)',
+    ignored_unsupported_type: 'ignored (unsupported file)',
+    ignored_unprocessable: 'ignored (corrupt/unreadable)',
+  };
+  const event = r.status.startsWith('ignored') ? 'ignored'
+    : r.status === 'approved' || r.status === 'needs_review' ? r.status : 'info';
+  const label = map[r.status] ?? r.status;
+  const detail = r.summary ? `${r.file} → ${label}: ${r.summary}` : `${r.file} → ${label}`;
+  return { source: 'vercel', event, detail };
+}
+
+function shortError(message: string): string {
+  if (/\b429\b|quota|rate limit/i.test(message)) return 'Gemini quota/rate-limit (429), will retry';
+  if (/\b5\d\d\b|overloaded|unavailable/i.test(message)) return 'Gemini temporarily unavailable, will retry';
+  return message.slice(0, 120);
 }
 
 // 400-class errors mean the file itself cannot be processed (corrupted image,
