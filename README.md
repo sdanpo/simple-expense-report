@@ -93,8 +93,12 @@ and reports how many remain, so the caller loops until `remaining: 0`. For each 
    both classifies (is this a receipt?) and extracts the fields.
 3. **Decide:**
    - Not a receipt, or low confidence → move to `Ignored`.
-   - A receipt → append a row to the Sheet, leave the file in `Processed`.
-4. **On error:** a permanent/"bad input" error (corrupt image) → `Ignored`; a transient error
+   - **Already in the Sheet** (same invoice number, or same date+amount+currency) → skip the row and
+     move to `Ignored`, logged as `duplicate`. This is what stops multiple photos of one receipt (or a
+     re-processed file) from creating duplicate rows.
+   - A new receipt → append a row to the Sheet, leave the file in `Processed`.
+4. **On error:** a *permanent* error — corrupt/unreadable image, or a Gemini **refusal/safety block**
+   (e.g. a photo of a person, which returns prose instead of JSON) → `Ignored`. A *transient* error
    (rate-limit, timeout) → moved back to `Inbox` to retry next cycle.
 
 **Once a day at 06:00 UTC (09:00 Israel)**, a Vercel cron also calls `/api/cron/process-invoices`
@@ -161,16 +165,21 @@ Runs as you, hourly. Key functions:
 | Function | Role |
 |----------|------|
 | `setup` | One-time: create the `AutoInvoiced` labels, create the Gmail filters, delete the rogue legacy `invoice-ingested` filter, install the hourly trigger. |
-| `runHourly` | The scheduled job: ingest email → trigger Vercel processing, within a 4-min budget. |
+| `runHourly` | The scheduled job (4-min budget): ingest email → consolidate stray inbox folders → trigger Vercel processing → auto-clean old Ignored files. |
 | `ingestLabeledThreads_` | Save attachments to Inbox; send body-only receipts to Vercel. |
 | `sendBodyToAnalyzer_` | POST a message body to `/api/admin/process-text`. |
 | `triggerProcessing_` | Ping `/api/cron/process-invoices` until the Inbox is drained. |
+| `consolidateInboxes_` | Move files out of any stray sibling folder named `inbox` into the real Inbox (self-heals a sync app that creates a duplicate). |
+| `cleanupIgnored_` | Auto-trash Ignored files older than `IGNORED_RETENTION_DAYS` (logs to the Log tab). |
+| `logToSheet_` / `hasSecret_` | Post a line to the unified Log tab; detect whether the real `CRON_SECRET` is set. |
 | `backfillRecentReceipts` | One-time: label + ingest receipt emails from the last 30 days. |
 | `forceReingest` | Un-mark recent threads so missed attachments re-ingest (dedup-safe). |
-| `resetInboxTrashAllFiles` | Trash everything in Inbox (+ Ignored). |
-| `clearAllInvoiceFolders` | Trash everything in Inbox + Processed + Ignored (full reset). |
+| `clearSheet` | Delete all data rows from the Sheet (keep header). |
+| `emptyIgnoredNow` | Trash everything in Ignored immediately. |
+| `cleanupProcessedOrphans` | Trash Processed files no Sheet row references (de-dupe the archive). |
+| `resetInboxTrashAllFiles` / `clearAllInvoiceFolders` | Trash the Inbox (+ Ignored) / all three folders — full reset. |
 
-`apps-script/appsscript.json` is the manifest (Gmail advanced service + OAuth scopes).
+`apps-script/appsscript.json` is the manifest (Gmail advanced service + OAuth scopes, incl. `spreadsheets`).
 `apps-script/Code.local.gs` is a gitignored copy with the secret filled in (don't commit it).
 
 ### Vercel — `src/app/api/**` (the "brain")
@@ -182,6 +191,7 @@ Runs as you, hourly. Key functions:
 | `POST /api/admin/process-url` | Analyze a receipt from a **public image/PDF URL** (e.g. a Google Photos share link). |
 | `GET  /api/admin/process-drive-file?ids=…` | Re-analyze existing Drive files by ID → Sheet (rebuild without re-ingesting from Gmail). |
 | `POST /api/admin/add-row` | Append a row with **explicit values** (manual correction, e.g. forcing a currency). |
+| `POST /api/admin/log` | Append a line to the unified **Log** tab (used by the Apps Script ingester). |
 | `GET  /api/admin/clean-sheet` | Delete all data rows (keep header). |
 | `GET  /api/admin/delete-rows?match=…` | Delete rows containing a substring (targeted removal). |
 | `GET  /api/admin/clean-inbox?folders=…` | **Does not work** — the service account is only an Editor and Google won't let it *trash* files you own. Folder clearing must be done from Apps Script (`clearAllInvoiceFolders`). |
@@ -192,8 +202,11 @@ All `/api/**` routes are protected by `Authorization: Bearer <CRON_SECRET>` (exc
 ### Vercel — `src/lib/**`
 - `gemini.ts` — the AI: model selection, the strict classify+extract **prompt**, `analyzeDocument`
   (files) and `analyzeText` (email bodies), with retry/backoff on transient errors.
-- `drive.ts` — list Inbox, download, move files (via the service account).
-- `sheets.ts` — ensure headers, append a row.
+- `drive.ts` — list Inbox, download, move files (via the service account). **The Inbox folder ID is
+  hardcoded here as `INBOX_ID`** (the original env-configured Inbox was accidentally trashed and
+  replaced by `1Dd8…`, which the photo-sync app writes to) — `GOOGLE_DRIVE_INBOX_ID` is no longer read.
+- `sheets.ts` — ensure headers, append a row, the unified Log tab (`appendLog`), and dedup keys
+  (`getExistingDedupKeys` / `dedupKey`).
 - `auth.ts` — service-account auth for Drive/Sheets.
 - `types.ts` — shared types.
 
@@ -207,7 +220,8 @@ All `/api/**` routes are protected by `Authorization: Bearer <CRON_SECRET>` (exc
 | `GEMINI_API_KEY` | Gemini API key (https://aistudio.google.com/apikey). |
 | `GEMINI_MODEL` | *(optional)* override the model; default `gemini-2.5-flash-lite`. |
 | `MAX_FILES_PER_RUN` | *(optional)* files processed per call; default `4`. |
-| `GOOGLE_DRIVE_INBOX_ID` / `_PROCESSED_ID` / `_IGNORED_ID` | The three folder IDs. |
+| `GOOGLE_DRIVE_PROCESSED_ID` / `_IGNORED_ID` | The Processed / Ignored folder IDs. (The **Inbox** ID is now hardcoded as `INBOX_ID` in `src/lib/drive.ts`; `GOOGLE_DRIVE_INBOX_ID` is unused.) |
+| `IGNORED_RETENTION_DAYS` | Set in Apps Script `CONFIG` (default 3) — auto-trash Ignored files older than this. |
 | `GOOGLE_SHEETS_ID` | The Expenses spreadsheet ID. |
 | `CRON_SECRET` | Shared secret protecting the API routes; the **same value** goes in Apps Script `CONFIG.CRON_SECRET`. |
 | `GMAIL_CLIENT_ID` / `_SECRET` / `_REFRESH_TOKEN` | *(legacy)* only used by the unused `gmail-to-inbox` route. |
@@ -230,8 +244,10 @@ All `/api/**` routes are protected by `Authorization: Bearer <CRON_SECRET>` (exc
 5. Run **`setup`**, authorize. Optionally run **`backfillRecentReceipts`** once to pull recent receipts.
 
 **Phone side (photos)**
-- Install a Drive-sync app and sync a folder to the Drive `Inbox`. Recommended: a **dedicated
-  "Receipts" folder** rather than the whole camera roll (see Known issues).
+- Install a Drive-sync app (this setup uses **FolderSync**, one-way "upload") and sync a folder into the
+  Drive `Inbox` folder (`INBOX_ID` in `src/lib/drive.ts`). This deployment syncs the whole camera roll
+  and relies on Gemini billing + dedup + auto-clean to absorb it; a dedicated "Receipts" folder avoids
+  processing personal photos (see Known issues).
 
 ---
 
@@ -281,17 +297,23 @@ exist (Apps Script **Executions**, Vercel **Logs**) but are only needed for deep
 
 ## 12. Known issues & design decisions
 
-- **Photo-sync floods the Inbox.** Pointing a sync app at your *whole camera roll* uploads every
-  personal photo and video, which all get run through Gemini (quota + noise) and can produce false
-  "receipts" (e.g. the "Bisfenol A" BPA text printed on thermal paper). **Fix:** sync a *dedicated
-  Receipts folder*, or apply a "newer than N days" + exclude-`*.mp4` filter. Also: the processor
-  *moves* files out of the Inbox, so a sync app set to re-mirror can re-upload them in a loop — use
-  one-way "upload" mode and ideally a dedicated folder.
+- **Photo-sync floods the Inbox — accepted by design here.** The phone (FolderSync) syncs the *whole
+  camera roll*, so every personal photo/video gets run through Gemini. **Decision:** keep it simple and
+  **enable Gemini API billing** (≈ $0.0002/image, a few cents/month) rather than scope the sync.
+  Personal photos classify to `Ignored` and auto-delete after `IGNORED_RETENTION_DAYS`; duplicate rows
+  are prevented by the dedup check. If you'd rather not pay to analyze personal photos, the alternative
+  is a *dedicated Receipts folder* (sync only that) or a "newer than N days" + exclude-`*.mp4` filter.
+  Note: the processor *moves* files out of the Inbox, so use one-way "upload" sync (not mirror) to
+  avoid re-upload loops; `consolidateInboxes_` also self-heals a duplicate `inbox` folder.
 - **The service account cannot trash files you own.** It's an Editor, and Google only lets the owner
-  trash. So `clean-inbox` fails; folder clearing is done from Apps Script (`clearAllInvoiceFolders`).
-  The service account *can* read/move/download files (even trashed ones, by ID, for ~30 days).
-- **Gemini free-tier quota is small.** `2.0-flash`/`2.5-flash` ≈ 20 req/day; we use `flash-lite`. For
-  heavy photo volume, enable Gemini API billing (cost ≈ $0.0002/image).
+  trash. So `clean-inbox` fails; folder clearing/auto-clean is done from Apps Script
+  (`clearAllInvoiceFolders`, `cleanupIgnored_`). The service account *can* read/move/download files
+  (even trashed ones, by ID, for ~30 days).
+- **Gemini free-tier quota is small.** `2.0-flash`/`2.5-flash` ≈ 20 req/day; we use `flash-lite` **with
+  billing enabled** so floods don't hit a cap. Gemini also *refuses* some images (e.g. photos of
+  people), returning prose not JSON — those are treated as permanent errors → `Ignored`.
+- **Duplicates from re-photographed receipts.** The same receipt shot several times = several photos;
+  the dedup check (invoice # / date+amount) ensures only one Sheet row.
 - **Google Photos ≠ Google Drive.** A photo backed up to Google Photos is not in Drive, and the Photos
   API is locked down — nothing can pull it automatically. A photo only enters the pipeline once it's
   in Drive (via a sync app, manual upload, or a share link processed with `process-url`).
