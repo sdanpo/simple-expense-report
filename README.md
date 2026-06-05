@@ -228,26 +228,103 @@ All `/api/**` routes are protected by `Authorization: Bearer <CRON_SECRET>` (exc
 
 ---
 
-## 9. Setup from scratch
+## 9. Setup from scratch — step by step
 
-**Vercel side**
-1. `GOOGLE_SERVICE_ACCOUNT_JSON`: create a service account, share `/Invoices` (Editor) and the Sheet
-   (Editor) with its email.
-2. Set the env vars above. Deploy (push to `master`; GitHub → Vercel auto-deploys).
-3. `curl https://<app>/api/setup` to create the Sheet headers.
+Setting this up takes about **30–40 minutes** the first time. You'll create some Google
+plumbing, deploy the app, then connect it to your Gmail and phone. Follow the parts in order.
 
-**Apps Script side** (this is what makes it hands-free)
-1. script.google.com → paste `apps-script/Code.gs`.
-2. Editor → **Services (+) → Gmail → Add** (lets it manage the Gmail filters).
-3. Project Settings → show `appsscript.json` → paste `apps-script/appsscript.json`.
-4. Set `CONFIG.CRON_SECRET` to the same value as Vercel's `CRON_SECRET`.
-5. Run **`setup`**, authorize. Optionally run **`backfillRecentReceipts`** once to pull recent receipts.
+> **What you'll need:** a Google account, a credit card (for Gemini billing — costs pennies),
+> and a GitHub + Vercel account (both have free tiers). No coding required — just copy/paste.
 
-**Phone side (photos)**
-- Install a Drive-sync app (this setup uses **FolderSync**, one-way "upload") and sync a folder into the
-  Drive `Inbox` folder (`INBOX_ID` in `src/lib/drive.ts`). This deployment syncs the whole camera roll
-  and relies on Gemini billing + dedup + auto-clean to absorb it; a dedicated "Receipts" folder avoids
-  processing personal photos (see Known issues).
+---
+
+### Part 1 — Google Drive folders & the Sheet (5 min)
+
+1. In Google Drive, create a folder named **`Invoices`**, and inside it three subfolders:
+   **`Inbox`**, **`Processed`**, **`Ignored`**.
+2. Create a Google **Sheet** (any name, e.g. "Invoice Expenses"). Leave it empty — the app adds
+   the header row itself.
+3. Note the **IDs** from the URLs (you'll paste them later). A folder ID is the part after
+   `/folders/`; a sheet ID is the part after `/d/`.
+   ```
+   drive.google.com/drive/folders/THIS_IS_THE_FOLDER_ID
+   docs.google.com/spreadsheets/d/THIS_IS_THE_SHEET_ID/edit
+   ```
+   Grab the IDs for **Inbox**, **Processed**, **Ignored**, and the **Sheet**.
+
+### Part 2 — Service account (lets the app read Drive & write the Sheet) (8 min)
+
+1. Go to **https://console.cloud.google.com** → create a project (e.g. "invoice-bot").
+2. **APIs & Services → Library** → enable **Google Drive API** and **Google Sheets API**.
+3. **APIs & Services → Credentials → Create credentials → Service account.** Give it a name, click
+   through to Done.
+4. Open the new service account → **Keys → Add key → Create new key → JSON.** A `.json` file
+   downloads — keep it; this is `GOOGLE_SERVICE_ACCOUNT_JSON`.
+5. Copy the service account's **email** (looks like `…@….iam.gserviceaccount.com`).
+6. Back in Google Drive: **share the `Invoices` folder and the Sheet** with that email, as **Editor**.
+   *(This is what lets the app file receipts and write rows.)*
+
+### Part 3 — Gemini API key + billing (3 min)
+
+1. Go to **https://aistudio.google.com/apikey** → **Create API key** → copy it (this is `GEMINI_API_KEY`).
+2. Click **Set up Billing** on the key's project and add a card. *(Required — without billing,
+   the free tier caps at ~20 requests/day and floods will stall. Real cost is a few cents/month.)*
+   Optional: in Google Cloud → Billing → Budgets, set a $5 alert for peace of mind.
+
+### Part 4 — Deploy the app to Vercel (8 min)
+
+1. **Fork/clone this repo** to your own GitHub.
+2. At **https://vercel.com** → **New Project** → import the repo. Don't deploy yet.
+3. In the project's **Settings → Environment Variables**, add:
+
+   | Variable | Value |
+   |----------|-------|
+   | `GOOGLE_SERVICE_ACCOUNT_JSON` | the entire JSON from Part 2, on one line |
+   | `GEMINI_API_KEY` | from Part 3 |
+   | `GOOGLE_DRIVE_PROCESSED_ID` | the Processed folder ID |
+   | `GOOGLE_DRIVE_IGNORED_ID` | the Ignored folder ID |
+   | `GOOGLE_SHEETS_ID` | the Sheet ID |
+   | `CRON_SECRET` | any random string — **generate one and keep it handy** (e.g. `openssl rand -hex 32`) |
+
+   > The **Inbox** folder ID lives in code, not env — set `INBOX_ID` in `src/lib/drive.ts` to your
+   > Inbox folder ID and commit. (It was moved out of env after the original Inbox was once trashed.)
+4. **Deploy** (Vercel builds automatically; future `git push` to `master` redeploys).
+5. Create the Sheet's header row — open in a browser (or curl):
+   `https://YOUR-APP.vercel.app/api/setup` with header `Authorization: Bearer YOUR_CRON_SECRET`.
+
+### Part 5 — Apps Script (the hands-free Gmail + scheduler part) (8 min)
+
+This is the piece that reads Gmail and runs everything on a schedule, **as you**.
+
+1. Go to **https://script.google.com → New project**. Delete the stub code.
+2. Open `apps-script/Code.gs` from this repo, copy **all** of it, and paste it in (replace everything).
+3. In `CONFIG` at the top, fill in **your** values: `INBOX_FOLDER_ID`, `PROCESSED_FOLDER_ID`,
+   `IGNORED_FOLDER_ID`, `SHEET_ID`, and `CRON_SECRET` (the **same** secret as Vercel).
+4. **Enable the Gmail service:** left sidebar **Services (+) → Gmail → Add**.
+5. **Add the manifest scopes:** ⚙️ **Project Settings** → tick *"Show appsscript.json"* → open the
+   `appsscript.json` file → paste the contents of `apps-script/appsscript.json` → Save.
+6. Select the **`setup`** function in the toolbar → **Run** → approve the permission prompts
+   (it's your own script: *Advanced → Go to project → Allow*). This creates the Gmail labels +
+   filters and installs the **hourly trigger**.
+7. *(Optional)* Run **`backfillRecentReceipts`** once to pull in receipt emails from the last 30 days.
+
+✅ **Check it worked:** in the Sheet you should see a **`Log` tab** with an `apps-script | ingest`
+line, and Apps Script → **Triggers** should show `runHourly · every hour`.
+
+### Part 6 — Phone photos (5 min)
+
+1. Install a one-way Drive sync app (**FolderSync** on Android, used here).
+2. Connect your Google account, then create a folderpair: **local** = your camera folder
+   (`DCIM/Camera`) → **remote** = the Drive **`Inbox`** folder. Sync type **"upload only"**.
+3. Enable scheduled sync (e.g. every 15 min).
+
+> This syncs your whole camera roll; Gemini billing + dedup + the 3-day Ignored auto-clean absorb the
+> personal photos. To avoid processing personal photos at all, point FolderSync at a dedicated
+> **"Receipts"** phone folder instead (see Known issues).
+
+### You're done 🎉
+Take a photo of a receipt or receive one by email → it appears as a row in the Sheet within the hour.
+Watch the **`Log` tab** to see it happen.
 
 ---
 
