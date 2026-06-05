@@ -131,11 +131,13 @@ function shortError(message: string): string {
   return message.slice(0, 120);
 }
 
-// 400-class errors mean the file itself cannot be processed (corrupted image,
-// unsupported content) — retrying will never help.
+// Errors that can never succeed on retry — route the file to Ignored instead of
+// bouncing it back to the Inbox forever. Includes 400-class input errors AND Gemini
+// refusals/safety blocks, which return prose instead of JSON ("No JSON in Gemini
+// response") — common for photos of people. Those are not receipts anyway.
 function isPermanentError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  return /\b400\b|Bad Request|Unable to process input/i.test(msg);
+  return /\b400\b|Bad Request|Unable to process input|No JSON in Gemini response|cannot fulfill|safety/i.test(msg);
 }
 
 function isAuthorized(req: NextRequest): boolean {
