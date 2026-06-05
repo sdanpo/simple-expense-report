@@ -25,7 +25,9 @@
  */
 
 const CONFIG = {
-  INBOX_FOLDER_ID: '1eaCs2dx-ZxwZYGA6xaqNQrKXblO7xWQG',
+  // New inbox folder (the original "Inbox" was accidentally trashed; this folder is
+  // the one the phone photo-sync app writes to). Vercel uses the same ID in drive.ts.
+  INBOX_FOLDER_ID: '1Dd8_DsDbm9zHqLWO69Z03WFWKHNPxQyf',
   PROCESSED_FOLDER_ID: '1qRyuo0sPXpEQfZfeaQfVQfix20w0tGyr',
   IGNORED_FOLDER_ID: '1PctH71brnmHySD1VSolcy4kek3ca4svW',
   SHEET_ID: '1dSWFwyXy9wdXMYpjPsrbRCPDVZj8_bI2d4qauCkIAA8',

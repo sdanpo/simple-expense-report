@@ -7,10 +7,16 @@ export interface DriveFile {
   webViewLink: string;
 }
 
+// The Drive Inbox folder. Hardcoded here (rather than from GOOGLE_DRIVE_INBOX_ID)
+// because the original env-configured Inbox was accidentally trashed and replaced by
+// this folder, which the phone photo-sync app already writes to. Processed/Ignored
+// still come from env. To change the inbox, edit this one value.
+export const INBOX_ID = '1Dd8_DsDbm9zHqLWO69Z03WFWKHNPxQyf';
+
 export async function listInboxFiles(): Promise<DriveFile[]> {
   const drive = getDriveClient();
   const res = await drive.files.list({
-    q: `'${process.env.GOOGLE_DRIVE_INBOX_ID}' in parents and trashed = false`,
+    q: `'${INBOX_ID}' in parents and trashed = false`,
     fields: 'files(id, name, mimeType, webViewLink)',
     pageSize: 100,
   });

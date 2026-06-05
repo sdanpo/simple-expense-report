@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { listInboxFiles, downloadFile, moveFile } from '@/lib/drive';
+import { listInboxFiles, downloadFile, moveFile, INBOX_ID } from '@/lib/drive';
 import { analyzeDocument, isSupportedMimeType } from '@/lib/gemini';
 import { appendRow, ensureSheetHeaders, appendLog, type LogEntry } from '@/lib/sheets';
 import type { SheetRow, InvoiceStatus } from '@/lib/types';
@@ -104,7 +104,7 @@ async function processFile(file: { id: string; name: string; mimeType: string; w
       return { file: file.name, status: 'ignored_unprocessable' };
     }
     // Roll back the claim so the file is retried next cycle.
-    await moveFile(file.id, process.env.GOOGLE_DRIVE_INBOX_ID!).catch(() => {});
+    await moveFile(file.id, INBOX_ID).catch(() => {});
     throw err;
   }
 }
