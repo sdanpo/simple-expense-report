@@ -141,13 +141,17 @@ function consolidateInboxes_() {
 // files are still recoverable from Drive trash for ~30 days.
 function cleanupIgnored_(deadline) {
   const cutoff = Date.now() - CONFIG.IGNORED_RETENTION_DAYS * 24 * 60 * 60 * 1000;
-  const files = DriveApp.getFolderById(CONFIG.IGNORED_FOLDER_ID).getFiles();
+  const ignored = DriveApp.getFolderById(CONFIG.IGNORED_FOLDER_ID);
+  const files = ignored.getFiles();
   let n = 0;
   while (files.hasNext()) {
     if (deadline && Date.now() > deadline) break;
     const f = files.next();
     if (f.getDateCreated().getTime() < cutoff) { f.setTrashed(true); n++; }
   }
+  // Sync-app artifact subfolders ("Raw", etc.) are never useful — trash them all.
+  const subs = ignored.getFolders();
+  while (subs.hasNext()) { subs.next().setTrashed(true); n++; }
   if (n > 0) {
     Logger.log('Auto-cleaned ' + n + ' old Ignored file(s).');
     logToSheet_('cleanup', 'auto-trashed ' + n + ' Ignored file(s) older than ' +
@@ -294,12 +298,12 @@ function clearAllInvoiceFolders() {
 }
 
 function trashAllIn_(folder) {
-  const files = folder.getFiles();
   let count = 0;
-  while (files.hasNext()) {
-    files.next().setTrashed(true);
-    count++;
-  }
+  const files = folder.getFiles();
+  while (files.hasNext()) { files.next().setTrashed(true); count++; }
+  // Also trash subfolders (e.g. sync-app "Raw" folders) so nothing is left behind.
+  const subs = folder.getFolders();
+  while (subs.hasNext()) { subs.next().setTrashed(true); count++; }
   return count;
 }
 
