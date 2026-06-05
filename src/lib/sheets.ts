@@ -127,6 +127,34 @@ async function trimLog(
   });
 }
 
+// A stable key identifying a receipt, for de-duplication. Prefer the invoice number;
+// otherwise fall back to date+amount+currency (vendor is omitted because Gemini reads
+// the same receipt's vendor inconsistently across photos).
+export function dedupKey(x: {
+  invoice_number?: string | null; invoice_date?: string | null;
+  total_amount?: string | number | null; currency?: string | null;
+}): string {
+  const inv = String(x.invoice_number ?? '').trim();
+  if (inv) return 'inv:' + inv.toLowerCase();
+  return 'vda:' + String(x.invoice_date ?? '') + '|' + String(x.total_amount ?? '') +
+    '|' + String(x.currency ?? '').toLowerCase();
+}
+
+// Keys for every receipt already in the Invoices sheet (for dedup).
+export async function getExistingDedupKeys(): Promise<Set<string>> {
+  const sheets = getSheetsClient();
+  const spreadsheetId = process.env.GOOGLE_SHEETS_ID!;
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `${SHEET_NAME}!A2:F`, // vendor..invoice_number (no header)
+  });
+  const keys = new Set<string>();
+  for (const r of res.data.values ?? []) {
+    keys.add(dedupKey({ invoice_date: r[1], total_amount: r[2], currency: r[3], invoice_number: r[5] }));
+  }
+  return keys;
+}
+
 export async function appendRow(row: SheetRow): Promise<void> {
   const sheets = getSheetsClient();
   const spreadsheetId = process.env.GOOGLE_SHEETS_ID!;

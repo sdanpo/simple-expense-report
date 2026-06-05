@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { listInboxFiles, downloadFile, moveFile, INBOX_ID } from '@/lib/drive';
 import { analyzeDocument, isSupportedMimeType } from '@/lib/gemini';
-import { appendRow, ensureSheetHeaders, appendLog, type LogEntry } from '@/lib/sheets';
+import { appendRow, ensureSheetHeaders, appendLog, getExistingDedupKeys, dedupKey, type LogEntry } from '@/lib/sheets';
 import type { SheetRow, InvoiceStatus } from '@/lib/types';
 
 export const maxDuration = 300;
@@ -23,10 +23,14 @@ export async function GET(req: NextRequest) {
     const allFiles = await listInboxFiles();
     const batch = allFiles.slice(0, MAX_FILES_PER_RUN);
 
+    // Receipts already in the Sheet — so multiple photos of the same receipt (or a
+    // re-processed file) don't create duplicate rows. Updated as we add within this run.
+    const seen = await getExistingDedupKeys();
+
     const logs: LogEntry[] = [];
     for (const file of batch) {
       try {
-        const result = await processFile(file);
+        const result = await processFile(file, seen);
         results.push(result);
         logs.push(logFor(result));
       } catch (err) {
@@ -48,7 +52,7 @@ export async function GET(req: NextRequest) {
   }
 }
 
-async function processFile(file: { id: string; name: string; mimeType: string; webViewLink: string }) {
+async function processFile(file: { id: string; name: string; mimeType: string; webViewLink: string }, seen: Set<string>) {
   if (!isSupportedMimeType(file.mimeType)) {
     await moveFile(file.id, process.env.GOOGLE_DRIVE_IGNORED_ID!);
     return { file: file.name, status: 'ignored_unsupported_type' };
@@ -69,6 +73,20 @@ async function processFile(file: { id: string; name: string; mimeType: string; w
       await moveFile(file.id, process.env.GOOGLE_DRIVE_IGNORED_ID!);
       return { file: file.name, status: 'ignored_not_invoice' };
     }
+
+    // Skip if this receipt is already in the Sheet (another photo of it, or a retry).
+    const key = dedupKey({
+      invoice_number: invoice.invoice_number,
+      invoice_date: invoice.invoice_date,
+      total_amount: invoice.total_amount,
+      currency: invoice.currency,
+    });
+    if (seen.has(key)) {
+      await moveFile(file.id, process.env.GOOGLE_DRIVE_IGNORED_ID!);
+      const dup = `${invoice.vendor ?? '?'} ${invoice.total_amount ?? ''} ${invoice.currency ?? ''}`.trim();
+      return { file: file.name, status: 'duplicate', summary: dup };
+    }
+    seen.add(key);
 
     // Validate
     const autoApprove =
@@ -118,7 +136,9 @@ function logFor(r: { file: string; status: string; summary?: string }): LogEntry
     ignored_unsupported_type: 'ignored (unsupported file)',
     ignored_unprocessable: 'ignored (corrupt/unreadable)',
   };
+  map['duplicate'] = 'duplicate (already in sheet)';
   const event = r.status.startsWith('ignored') ? 'ignored'
+    : r.status === 'duplicate' ? 'duplicate'
     : r.status === 'approved' || r.status === 'needs_review' ? r.status : 'info';
   const label = map[r.status] ?? r.status;
   const detail = r.summary ? `${r.file} → ${label}: ${r.summary}` : `${r.file} → ${label}`;
