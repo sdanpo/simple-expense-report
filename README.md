@@ -8,8 +8,6 @@ even a real receipt, and files it.
 | | |
 |---|---|
 | **Live app (Vercel)** | https://simpleexpensereport.vercel.app |
-| **Drive folder** | https://drive.google.com/drive/folders/1EaS0WCSTQutUK7VigyxeTIve8LHTKRFx |
-| **Expenses Sheet** | https://docs.google.com/spreadsheets/d/1dSWFwyXy9wdXMYpjPsrbRCPDVZj8_bI2d4qauCkIAA8 |
 | **Repo** | https://github.com/sdanpo/simple-expense-report (auto-deploys to Vercel on push to `master`) |
 
 ---
