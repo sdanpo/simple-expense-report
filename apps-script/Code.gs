@@ -97,8 +97,40 @@ function runHourly() {
   const ingested = ingestLabeledThreads_(deadline);
   Logger.log('Ingested ' + ingested + ' attachment(s).');
   logToSheet_('ingest', 'hourly run: ingested ' + ingested + ' email item(s)');
+  consolidateInboxes_();   // self-heal: pull files from any duplicate "inbox" folder
   triggerProcessing_(deadline);
   cleanupIgnored_(deadline);
+}
+
+// A phone sync app (FolderSync) sometimes uploads into a DIFFERENT folder than the
+// real Inbox — e.g. it created a sibling folder literally named "inbox" (lowercase)
+// next to "Inbox". Files there are never processed. Each run, move anything from a
+// sibling folder whose name is "inbox" (case-insensitive, and not the real Inbox)
+// into the real Inbox so nothing is ever stranded.
+function consolidateInboxes_() {
+  const inbox = DriveApp.getFolderById(CONFIG.INBOX_FOLDER_ID);
+  const parents = inbox.getParents();
+  if (!parents.hasNext()) return 0;
+  const root = parents.next();
+  const folders = root.getFolders();
+  let moved = 0;
+  while (folders.hasNext()) {
+    const f = folders.next();
+    if (f.getId() === CONFIG.INBOX_FOLDER_ID) continue;
+    if (f.getName().toLowerCase() !== 'inbox') continue;
+    const files = f.getFiles();
+    while (files.hasNext()) {
+      const file = files.next();
+      inbox.addFile(file);
+      f.removeFile(file);
+      moved++;
+    }
+  }
+  if (moved > 0) {
+    Logger.log('Consolidated ' + moved + ' file(s) from a duplicate "inbox" folder.');
+    logToSheet_('consolidate', 'moved ' + moved + ' file(s) from a duplicate "inbox" folder into the real Inbox');
+  }
+  return moved;
 }
 
 // (a) ONGOING auto-clean: trash Ignored files older than IGNORED_RETENTION_DAYS.
