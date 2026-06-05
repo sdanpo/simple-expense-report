@@ -83,7 +83,7 @@ function setup() {
   ScriptApp.getProjectTriggers().forEach(function (t) { ScriptApp.deleteTrigger(t); });
   ScriptApp.newTrigger('runHourly').timeBased().everyHours(1).create();
 
-  if (CONFIG.CRON_SECRET === 'PASTE_CRON_SECRET_HERE') {
+  if (!hasSecret_()) {
     Logger.log('WARNING: CONFIG.CRON_SECRET is not set. Ingestion will work, but the ' +
       'processor cannot be triggered (401). Paste the real CRON_SECRET and save.');
   }
@@ -125,7 +125,7 @@ function cleanupIgnored_(deadline) {
 // Write one line to the unified Log tab in the Sheet (via Vercel), so the whole
 // system's activity is visible in one place. Never throws.
 function logToSheet_(event, detail) {
-  if (CONFIG.CRON_SECRET === 'PASTE_CRON_SECRET_HERE') return;
+  if (!hasSecret_()) return;
   try {
     UrlFetchApp.fetch(CONFIG.LOG_URL, {
       method: 'post', contentType: 'application/json',
@@ -321,7 +321,7 @@ function ingestLabeledThreads_(deadline) {
 // receipts delivered in the email body, not as attachments). Returns 1 if a row was
 // added, else 0. The endpoint classifies and ignores non-receipts.
 function sendBodyToAnalyzer_(msg) {
-  if (CONFIG.CRON_SECRET === 'PASTE_CRON_SECRET_HERE') return 0;
+  if (!hasSecret_()) return 0;
   const body = (msg.getPlainBody() || '').slice(0, 18000);
   if (body.replace(/\s/g, '').length < 40) return 0; // nothing meaningful to analyze
   const dateStr = Utilities.formatDate(msg.getDate(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
@@ -380,7 +380,7 @@ function resolveMimeType_(att) {
 // batch per call and reports `remaining`). Stops at the time budget so the script
 // never exceeds the Apps Script execution limit — leftovers are picked up next hour.
 function triggerProcessing_(deadline) {
-  if (CONFIG.CRON_SECRET === 'PASTE_CRON_SECRET_HERE') {
+  if (!hasSecret_()) {
     Logger.log('Skipping processing trigger: CONFIG.CRON_SECRET is not set.');
     return;
   }
@@ -408,6 +408,13 @@ function triggerProcessing_(deadline) {
 
 function ensureLabel_(name) {
   return GmailApp.getUserLabelByName(name) || GmailApp.createLabel(name);
+}
+
+// True once the real CRON_SECRET has been pasted into CONFIG. The placeholder value
+// starts with "PASTE_", so an un-edited file reads as "not set". (Written this way so
+// filling in the secret never accidentally rewrites this check.)
+function hasSecret_() {
+  return CONFIG.CRON_SECRET && CONFIG.CRON_SECRET.indexOf('PASTE_') !== 0;
 }
 
 // ---------- Gmail filter management (requires the Gmail Advanced Service) ----------
