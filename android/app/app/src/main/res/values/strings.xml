@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">Expense Report</string>
+    <string name="sign_in">Sign in with Google</string>
+    <string name="sync_now">Sync now</string>
+    <string name="grant_permission">Allow photo access</string>
+    <string name="channel_receipts">Receipt updates</string>
+</resources>

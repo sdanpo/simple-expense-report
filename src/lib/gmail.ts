@@ -17,8 +17,6 @@ const ATTACHMENT_MIME_TYPES = new Set([
   'image/jpeg',
   'image/jpg',
   'image/png',
-  'image/heic',
-  'image/heif',
   'image/webp',
   'application/pdf',
 ]);

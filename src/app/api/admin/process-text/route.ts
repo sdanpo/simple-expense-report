@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { analyzeText } from '@/lib/gemini';
 import { appendRow, ensureSheetHeaders, appendLog } from '@/lib/sheets';
-import type { SheetRow, InvoiceStatus } from '@/lib/types';
+import { isReceipt, analysisToRow, summarize } from '@/lib/pipeline';
 
 export const maxDuration = 60;
 export const dynamic = 'force-dynamic';
@@ -31,39 +31,23 @@ export async function POST(req: NextRequest) {
   try {
     await ensureSheetHeaders();
     const invoice = await analyzeText(body.text);
-    if (!invoice.is_invoice || invoice.confidence < 0.5) {
+    if (!isReceipt(invoice)) {
       await appendLog([{ source: 'vercel', event: 'ignored',
         detail: `${body.file_name ?? 'email body'} → email body not a receipt` }]);
       return NextResponse.json({ status: 'not_a_receipt', analysis: invoice });
     }
 
-    const autoApprove =
-      invoice.vendor !== null &&
-      invoice.invoice_date !== null &&
-      invoice.total_amount !== null &&
-      invoice.confidence >= 0.8;
-    const status: InvoiceStatus = autoApprove ? 'Approved' : 'Needs Review';
-
-    const row: SheetRow = {
-      vendor: invoice.vendor ?? '',
-      invoice_date: invoice.invoice_date ?? '',
-      total_amount: invoice.total_amount?.toString() ?? '',
-      currency: invoice.currency ?? '',
-      tax_amount: invoice.tax_amount?.toString() ?? '',
-      invoice_number: invoice.invoice_number ?? '',
-      confidence: invoice.confidence.toFixed(2),
-      status,
+    const row = analysisToRow(invoice, {
       file_name: body.file_name ?? 'email-body-receipt',
       drive_link: body.source_link ?? '',
-      processed_at: new Date().toISOString(),
-    };
+    });
     await appendRow(row);
 
     await appendLog([{
-      source: 'vercel', event: status === 'Approved' ? 'approved' : 'needs_review',
-      detail: `${body.file_name ?? 'email body'} → email-body receipt: ${invoice.vendor ?? '?'} ${invoice.total_amount ?? ''} ${invoice.currency ?? ''}`.trim(),
+      source: 'vercel', event: row.status === 'Approved' ? 'approved' : 'needs_review',
+      detail: `${body.file_name ?? 'email body'} → email-body receipt: ${summarize(invoice)}`,
     }]);
-    return NextResponse.json({ status: status.toLowerCase().replace(' ', '_'), row });
+    return NextResponse.json({ status: row.status.toLowerCase().replace(' ', '_'), row });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return NextResponse.json({ error: message }, { status: 500 });

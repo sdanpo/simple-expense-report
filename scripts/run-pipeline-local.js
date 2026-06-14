@@ -19,7 +19,7 @@ const drive = google.drive({ version: 'v3', auth });
 const sheets = google.sheets({ version: 'v4', auth });
 const model = new GoogleGenerativeAI(env.GEMINI_API_KEY).getGenerativeModel({ model: 'gemini-2.5-flash' });
 
-const SUPPORTED = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf']);
+const SUPPORTED = new Set(['image/jpeg', 'image/png', 'image/webp', 'application/pdf']);
 const extractJSON = (t) => JSON.parse(t.match(/\{[\s\S]*\}/)[0]);
 
 async function classify(buf, mime) {

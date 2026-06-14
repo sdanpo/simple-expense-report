@@ -6,7 +6,10 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "setup-gmail": "node scripts/setup-gmail-auth.js"
+    "setup-gmail": "node scripts/setup-gmail-auth.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "next": "14.2.3",
@@ -19,6 +22,7 @@
   "devDependencies": {
     "@types/node": "^20",
     "@types/react": "^18",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^2.1.8"
   }
 }
