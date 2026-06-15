@@ -14,17 +14,17 @@ even a real receipt, and files it.
 > Sections 1–13 below describe the **current production** flow (Apps Script ingests
 > Gmail → Drive Inbox; FolderSync uploads phone photos). A **new path is being rolled
 > out** to make this a real product that's easy for non-techies to install:
-> - **Photos:** a native **Android app** (`android/`) replaces FolderSync — a normal
->   camera photo (even from the lock screen) is gated on-device and uploaded straight
->   to the backend. See [`android/README.md`](android/README.md).
+> - **Photos:** a native **Android app** replaces FolderSync — a normal camera photo
+>   (even from the lock screen) is gated on-device and uploaded straight to the
+>   backend. The app is its **own repo**:
+>   **https://github.com/sdanpo/expense-report-android** (talks to this backend only
+>   via `POST /api/inbound`).
 > - **Email:** `GET /api/cron/ingest-gmail` reads Gmail **directly on Vercel**
 >   (no Apps Script, no Drive needed) and writes rows.
 > - **Upload endpoint:** `POST /api/inbound` accepts photos from the app.
 > - **New env vars:** `INBOUND_TOKENS` (+ optional `MAX_GMAIL_PER_RUN`) — see §8.
-> - **Tests:** backend `npm test` (vitest, 58) and `cd android/core && ./gradlew test`
->   (33). The old paths still work and are untouched during the transition.
->
-> Full plan + status: `.claude/.../memory/android-app-plan.md`.
+> - **Tests:** backend `npm test` (vitest, 58). The old paths still work and are
+>   untouched during the transition.
 
 ---
 
@@ -440,11 +440,7 @@ src/
   lib/                            ← gemini, drive, sheets, auth, types,
                                      pipeline (shared pure core), gmail-ingest, inbound-auth
   lib/*.test.ts, tests/           ← vitest suites (run: npm test)
-android/
-  core/               ← NEW: pure-Kotlin logic, JVM unit-tested (cd android/core && ./gradlew test)
-  app/                ← NEW: native Android app (open android/app in Android Studio)
-  README.md           ← build + distribution + device-test checklist
-scripts/            ← local diagnostics (run against .env.local)
+scripts/            ← local diagnostics (run against .env.local) + smoke-inbound.mjs
 vercel.json         ← daily crons: process-invoices (06:00) + ingest-gmail (07:00) UTC
 vitest.config.ts    ← test config
 ```

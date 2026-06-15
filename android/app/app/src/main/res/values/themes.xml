@@ -1,5 +1,0 @@
-<resources>
-    <style name="Theme.ExpenseReport" parent="Theme.AppCompat.DayNight.NoActionBar">
-        <item name="android:windowLightStatusBar">true</item>
-    </style>
-</resources>
