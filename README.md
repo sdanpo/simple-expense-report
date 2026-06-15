@@ -201,7 +201,7 @@ Runs as you, hourly. Key functions:
 |-------|---------|
 | `GET /api/cron/process-invoices` | **Main processor.** Process up to 4 Inbox files → Gemini → Sheet → move. Returns `{processed, remaining, results}`. Also the daily Vercel cron target. Auth: `Bearer CRON_SECRET`. |
 | `POST /api/inbound` | **NEW.** Photo upload from the Android app (multipart `file`). Gemini → dedup → Sheet. No Drive. Auth: `Bearer` token from `INBOUND_TOKENS`/`CRON_SECRET`. HTTP codes are a contract: `200` terminal, `401` re-auth, `413` too large, `503` retry. |
-| `GET /api/cron/ingest-gmail` | **NEW.** Reads invoice-like Gmail directly (search query, no filter), analyzes attachments + body text in memory, writes rows, labels messages done. **Replaces the Apps Script ingester.** Daily Vercel cron. Auth: `Bearer CRON_SECRET`. |
+| `GET /api/cron/ingest-gmail` | **NEW.** Reads invoice-like Gmail directly (search query, no filter), analyzes attachments + body text in memory, writes rows, labels messages done. **Replaces the Apps Script ingester.** Endpoint is ready but **not scheduled yet** — enable in `vercel.json` when retiring Apps Script. Auth: `Bearer CRON_SECRET`. |
 | `GET /api/setup` | Ensure the Sheet exists with headers; echo the configured IDs. |
 | `POST /api/admin/process-text` | Analyze a receipt delivered as **email body text** (Uber, Metropark). |
 | `POST /api/admin/process-url` | Analyze a receipt from a **public image/PDF URL** (e.g. a Google Photos share link). |
@@ -441,6 +441,6 @@ src/
                                      pipeline (shared pure core), gmail-ingest, inbound-auth
   lib/*.test.ts, tests/           ← vitest suites (run: npm test)
 scripts/            ← local diagnostics (run against .env.local) + smoke-inbound.mjs
-vercel.json         ← daily crons: process-invoices (06:00) + ingest-gmail (07:00) UTC
+vercel.json         ← daily cron: process-invoices (06:00 UTC). ingest-gmail endpoint exists but is NOT scheduled yet
 vitest.config.ts    ← test config
 ```
