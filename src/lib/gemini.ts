@@ -13,8 +13,6 @@ const SUPPORTED_MIME_TYPES = new Set([
   'image/png',
   'image/gif',
   'image/webp',
-  'image/heic',
-  'image/heif',
   'application/pdf',
 ]);
 

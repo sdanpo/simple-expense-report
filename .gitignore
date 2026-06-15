@@ -12,7 +12,11 @@ apps-script/Code.local.gs
 # node / next
 node_modules/
 .next/
+next-env.d.ts
 *.log
+
+# macOS
+.DS_Store
 
 # local test + diagnostic artifacts
 g.html

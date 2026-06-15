@@ -66,11 +66,11 @@ const CONFIG = {
 const ALLOWED_TYPES = {
   'application/pdf': 'application/pdf',
   'image/jpeg': 'image/jpeg', 'image/jpg': 'image/jpeg', 'image/png': 'image/png',
-  'image/heic': 'image/heic', 'image/heif': 'image/heif', 'image/webp': 'image/webp',
+  'image/webp': 'image/webp',
 };
 const EXTENSION_TYPES = {
   pdf: 'application/pdf', jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
-  heic: 'image/heic', heif: 'image/heif', webp: 'image/webp',
+  webp: 'image/webp',
 };
 
 /** Run ONCE manually: authorizes scopes, creates labels + Gmail filter, installs the hourly trigger. */

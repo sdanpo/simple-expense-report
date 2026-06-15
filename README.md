@@ -10,6 +10,22 @@ even a real receipt, and files it.
 | **Live app (Vercel)** | https://simpleexpensereport.vercel.app |
 | **Repo** | https://github.com/sdanpo/simple-expense-report (auto-deploys to Vercel on push to `master`) |
 
+> ### 🚧 In transition — new architecture (replacing Apps Script + FolderSync)
+> Sections 1–13 below describe the **current production** flow (Apps Script ingests
+> Gmail → Drive Inbox; FolderSync uploads phone photos). A **new path is being rolled
+> out** to make this a real product that's easy for non-techies to install:
+> - **Photos:** a native **Android app** replaces FolderSync — a normal camera photo
+>   (even from the lock screen) is gated on-device and uploaded straight to the
+>   backend. The app is its **own repo**:
+>   **https://github.com/sdanpo/expense-report-android** (talks to this backend only
+>   via `POST /api/inbound`).
+> - **Email:** `GET /api/cron/ingest-gmail` reads Gmail **directly on Vercel**
+>   (no Apps Script, no Drive needed) and writes rows.
+> - **Upload endpoint:** `POST /api/inbound` accepts photos from the app.
+> - **New env vars:** `INBOUND_TOKENS` (+ optional `MAX_GMAIL_PER_RUN`) — see §8.
+> - **Tests:** backend `npm test` (vitest, 58). The old paths still work and are
+>   untouched during the transition.
+
 ---
 
 ## 1. The big picture — what happens, and why
@@ -184,6 +200,8 @@ Runs as you, hourly. Key functions:
 | Route | Purpose |
 |-------|---------|
 | `GET /api/cron/process-invoices` | **Main processor.** Process up to 4 Inbox files → Gemini → Sheet → move. Returns `{processed, remaining, results}`. Also the daily Vercel cron target. Auth: `Bearer CRON_SECRET`. |
+| `POST /api/inbound` | **NEW.** Photo upload from the Android app (multipart `file`). Gemini → dedup → Sheet. No Drive. Auth: `Bearer` token from `INBOUND_TOKENS`/`CRON_SECRET`. HTTP codes are a contract: `200` terminal, `401` re-auth, `413` too large, `503` retry. |
+| `GET /api/cron/ingest-gmail` | **NEW.** Reads invoice-like Gmail directly (search query, no filter), analyzes attachments + body text in memory, writes rows, labels messages done. **Replaces the Apps Script ingester.** Endpoint is ready but **not scheduled yet** — enable in `vercel.json` when retiring Apps Script. Auth: `Bearer CRON_SECRET`. |
 | `GET /api/setup` | Ensure the Sheet exists with headers; echo the configured IDs. |
 | `POST /api/admin/process-text` | Analyze a receipt delivered as **email body text** (Uber, Metropark). |
 | `POST /api/admin/process-url` | Analyze a receipt from a **public image/PDF URL** (e.g. a Google Photos share link). |
@@ -207,6 +225,11 @@ All `/api/**` routes are protected by `Authorization: Bearer <CRON_SECRET>` (exc
   (`getExistingDedupKeys` / `dedupKey`).
 - `auth.ts` — service-account auth for Drive/Sheets.
 - `types.ts` — shared types.
+- `pipeline.ts` — **NEW.** Shared *pure* logic (classify→status→row, error classification) reused by
+  every ingestion path; fully unit-tested (`pipeline.test.ts`).
+- `gmail-ingest.ts` — **NEW.** Direct Gmail→Sheet ingestion (the Apps Script replacement); pure MIME
+  helpers are unit-tested.
+- `inbound-auth.ts` — **NEW.** Bearer-token auth for `/api/inbound`.
 
 ---
 
@@ -221,8 +244,10 @@ All `/api/**` routes are protected by `Authorization: Bearer <CRON_SECRET>` (exc
 | `GOOGLE_DRIVE_PROCESSED_ID` / `_IGNORED_ID` | The Processed / Ignored folder IDs. (The **Inbox** ID is now hardcoded as `INBOX_ID` in `src/lib/drive.ts`; `GOOGLE_DRIVE_INBOX_ID` is unused.) |
 | `IGNORED_RETENTION_DAYS` | Set in Apps Script `CONFIG` (default 3) — auto-trash Ignored files older than this. |
 | `GOOGLE_SHEETS_ID` | The Expenses spreadsheet ID. |
-| `CRON_SECRET` | Shared secret protecting the API routes; the **same value** goes in Apps Script `CONFIG.CRON_SECRET`. |
-| `GMAIL_CLIENT_ID` / `_SECRET` / `_REFRESH_TOKEN` | *(legacy)* only used by the unused `gmail-to-inbox` route. |
+| `CRON_SECRET` | Shared secret protecting the API routes; the **same value** goes in Apps Script `CONFIG.CRON_SECRET`. Also accepted as an `/api/inbound` token. |
+| `INBOUND_TOKENS` | **NEW.** Comma-separated bearer tokens accepted by `POST /api/inbound` (the Android app). Empty = allow all (dev only). The token also goes in the app build as `INBOUND_TOKEN`. |
+| `MAX_GMAIL_PER_RUN` | **NEW, optional.** Messages processed per `/api/cron/ingest-gmail` run; default `8`. |
+| `GMAIL_CLIENT_ID` / `_SECRET` / `_REFRESH_TOKEN` | Gmail OAuth token. Used by the new `ingest-gmail` cron (reads Gmail directly) and the legacy `gmail-to-inbox` route. |
 
 ---
 
@@ -404,13 +429,18 @@ exist (Apps Script **Executions**, Vercel **Logs**) but are only needed for deep
 
 ```
 apps-script/
-  Code.gs           ← the hourly Gmail→Inbox ingester + Vercel trigger (paste into script.google.com)
+  Code.gs           ← the hourly Gmail→Inbox ingester + Vercel trigger (being replaced by ingest-gmail)
   appsscript.json   ← Apps Script manifest (scopes + Gmail advanced service)
 src/
-  app/api/cron/process-invoices/  ← the main processor
+  app/api/inbound/                ← NEW: photo upload from the Android app
+  app/api/cron/ingest-gmail/      ← NEW: direct Gmail→Sheet (Apps Script replacement)
+  app/api/cron/process-invoices/  ← the main Drive-Inbox processor
   app/api/admin/*                 ← operational endpoints (text/url/drive-file/add-row/clean/delete)
   app/api/setup/                  ← header bootstrap
-  lib/                            ← gemini, drive, sheets, auth, types
-scripts/            ← local diagnostics (run against .env.local)
-vercel.json         ← the daily 06:00 UTC backstop cron
+  lib/                            ← gemini, drive, sheets, auth, types,
+                                     pipeline (shared pure core), gmail-ingest, inbound-auth
+  lib/*.test.ts, tests/           ← vitest suites (run: npm test)
+scripts/            ← local diagnostics (run against .env.local) + smoke-inbound.mjs
+vercel.json         ← daily cron: process-invoices (06:00 UTC). ingest-gmail endpoint exists but is NOT scheduled yet
+vitest.config.ts    ← test config
 ```

@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { listInboxFiles, downloadFile, moveFile, INBOX_ID } from '@/lib/drive';
 import { analyzeDocument, isSupportedMimeType } from '@/lib/gemini';
 import { appendRow, ensureSheetHeaders, appendLog, getExistingDedupKeys, dedupKey, type LogEntry } from '@/lib/sheets';
-import type { SheetRow, InvoiceStatus } from '@/lib/types';
+import { isReceipt, analysisToRow, summarize, isPermanentError, shortError } from '@/lib/pipeline';
 
 export const maxDuration = 300;
 export const dynamic = 'force-dynamic';
@@ -69,7 +69,7 @@ async function processFile(file: { id: string; name: string; mimeType: string; w
 
     // Single Gemini call: classify + extract together (free-tier quota is scarce).
     const invoice = await analyzeDocument(content, file.mimeType);
-    if (!invoice.is_invoice || invoice.confidence < 0.5) {
+    if (!isReceipt(invoice)) {
       await moveFile(file.id, process.env.GOOGLE_DRIVE_IGNORED_ID!);
       return { file: file.name, status: 'ignored_not_invoice' };
     }
@@ -83,37 +83,15 @@ async function processFile(file: { id: string; name: string; mimeType: string; w
     });
     if (seen.has(key)) {
       await moveFile(file.id, process.env.GOOGLE_DRIVE_IGNORED_ID!);
-      const dup = `${invoice.vendor ?? '?'} ${invoice.total_amount ?? ''} ${invoice.currency ?? ''}`.trim();
-      return { file: file.name, status: 'duplicate', summary: dup };
+      return { file: file.name, status: 'duplicate', summary: summarize(invoice) };
     }
     seen.add(key);
 
-    // Validate
-    const autoApprove =
-      invoice.vendor !== null &&
-      invoice.invoice_date !== null &&
-      invoice.total_amount !== null &&
-      invoice.confidence >= 0.8;
-    const status: InvoiceStatus = autoApprove ? 'Approved' : 'Needs Review';
-
     // Write to Sheets (file already in Processed from the claim step)
-    const row: SheetRow = {
-      vendor: invoice.vendor ?? '',
-      invoice_date: invoice.invoice_date ?? '',
-      total_amount: invoice.total_amount?.toString() ?? '',
-      currency: invoice.currency ?? '',
-      tax_amount: invoice.tax_amount?.toString() ?? '',
-      invoice_number: invoice.invoice_number ?? '',
-      confidence: invoice.confidence.toFixed(2),
-      status,
-      file_name: file.name,
-      drive_link: file.webViewLink,
-      processed_at: new Date().toISOString(),
-    };
+    const row = analysisToRow(invoice, { file_name: file.name, drive_link: file.webViewLink });
     await appendRow(row);
 
-    const summary = `${invoice.vendor ?? '?'} ${invoice.total_amount ?? ''} ${invoice.currency ?? ''}`.trim();
-    return { file: file.name, status: status.toLowerCase().replace(' ', '_'), summary };
+    return { file: file.name, status: row.status.toLowerCase().replace(' ', '_'), summary: summarize(invoice) };
   } catch (err) {
     // Permanent input errors (corrupted/unreadable file) can never succeed —
     // route to Ignored instead of retrying forever.
@@ -143,21 +121,6 @@ function logFor(r: { file: string; status: string; summary?: string }): LogEntry
   const label = map[r.status] ?? r.status;
   const detail = r.summary ? `${r.file} → ${label}: ${r.summary}` : `${r.file} → ${label}`;
   return { source: 'vercel', event, detail };
-}
-
-function shortError(message: string): string {
-  if (/\b429\b|quota|rate limit/i.test(message)) return 'Gemini quota/rate-limit (429), will retry';
-  if (/\b5\d\d\b|overloaded|unavailable/i.test(message)) return 'Gemini temporarily unavailable, will retry';
-  return message.slice(0, 120);
-}
-
-// Errors that can never succeed on retry — route the file to Ignored instead of
-// bouncing it back to the Inbox forever. Includes 400-class input errors AND Gemini
-// refusals/safety blocks, which return prose instead of JSON ("No JSON in Gemini
-// response") — common for photos of people. Those are not receipts anyway.
-function isPermanentError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /\b400\b|Bad Request|Unable to process input|No JSON in Gemini response|cannot fulfill|safety/i.test(msg);
 }
 
 function isAuthorized(req: NextRequest): boolean {
