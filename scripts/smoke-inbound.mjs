@@ -29,6 +29,7 @@ const TOKEN = args.token || process.env.SMOKE_TOKEN || process.env.CRON_SECRET |
 const CRON_SECRET = args['cron-secret'] || process.env.CRON_SECRET || TOKEN;
 const IMAGE = args.image || '';
 const DO_GMAIL = Boolean(args.gmail);
+const EXPECT_RECEIPT = Boolean(args['expect-receipt']);
 
 if (!URL) fail('Missing --url (or SMOKE_URL). Example: --url https://your-app.vercel.app');
 if (!TOKEN) fail('Missing --token (or SMOKE_TOKEN). Must match a backend INBOUND_TOKENS value.');
@@ -41,13 +42,6 @@ function record(name, ok, detail) {
   if (!ok) failures++;
   console.log(`${ok ? '✓' : '✗'} ${name}${detail ? ` — ${detail}` : ''}`);
 }
-
-// A 1x1 PNG (valid image, but Gemini will classify it "not a receipt"): used to
-// exercise the supported-but-not-a-receipt path without needing a real photo.
-const TINY_PNG = Buffer.from(
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
-  'base64'
-);
 
 async function postInbound({ token, bytes, fileName, mime }) {
   const form = new FormData();
@@ -65,35 +59,41 @@ async function postInbound({ token, bytes, fileName, mime }) {
 async function run() {
   console.log(`\nSmoke-testing ${URL}\n`);
 
-  // 1. Auth: missing token -> 401
+  // Buffer above the 1 KB floor so structural tests reach the mime/Gemini stages
+  // instead of short-circuiting on `ignored_too_small`.
+  const PAD_2KB = Buffer.alloc(2048, 1);
+
+  // 1. Auth: missing token -> 401 (auth is checked before anything else)
   try {
-    const r = await postInbound({ token: '', bytes: TINY_PNG, fileName: 'noauth.png', mime: 'image/png' });
+    const r = await postInbound({ token: '', bytes: PAD_2KB, fileName: 'noauth.png', mime: 'image/png' });
     record('inbound rejects missing token (401)', r.status === 401, `got ${r.status}`);
   } catch (e) { record('inbound rejects missing token (401)', false, e.message); }
 
   // 2. Unsupported type -> 200 ignored_unsupported_type (terminal, not an error)
   try {
-    const r = await postInbound({ token: TOKEN, bytes: TINY_PNG, fileName: 'x.heic', mime: 'image/heic' });
+    const r = await postInbound({ token: TOKEN, bytes: PAD_2KB, fileName: 'x.heic', mime: 'image/heic' });
     record('inbound ignores unsupported type (200 terminal)',
-      r.status === 200 && String(r.body.status).startsWith('ignored'),
+      r.status === 200 && r.body.status === 'ignored_unsupported_type',
       `${r.status} ${r.body.status}`);
   } catch (e) { record('inbound ignores unsupported type', false, e.message); }
 
-  // 3a. Supported image, valid token. With the tiny PNG, expect not_a_receipt;
-  //     with a real --image, expect approved/needs_review (or duplicate on re-run).
-  try {
-    const bytes = IMAGE ? readFileSync(IMAGE) : TINY_PNG;
-    const fileName = IMAGE ? basename(IMAGE) : 'tiny.png';
-    const mime = IMAGE ? guessMime(IMAGE) : 'image/png';
-    const r = await postInbound({ token: TOKEN, bytes, fileName, mime });
-    const ok = r.status === 200;
-    record('inbound accepts a supported upload (200)', ok, `${r.status} ${r.body.status}`);
-    if (IMAGE) {
-      const good = ['approved', 'needs_review', 'duplicate'].includes(r.body.status);
-      record('  real receipt classified as a receipt', good,
-        good ? (r.body.summary || r.body.status) : `unexpected status ${r.body.status}`);
-    }
-  } catch (e) { record('inbound accepts a supported upload', false, e.message); }
+  // 3. Supported image -> exercises Gemini + Sheets. Any VALID classification proves
+  //    the integration works; pass --expect-receipt to also assert it's a receipt.
+  if (IMAGE) {
+    try {
+      const bytes = readFileSync(IMAGE);
+      const r = await postInbound({ token: TOKEN, bytes, fileName: basename(IMAGE), mime: guessMime(IMAGE) });
+      const valid = ['approved', 'needs_review', 'duplicate', 'not_a_receipt'].includes(r.body.status);
+      record('inbound runs Gemini + Sheets on a real image (200, valid classification)',
+        r.status === 200 && valid, `${r.status} ${r.body.status}${r.body.summary ? ` (${r.body.summary})` : ''}`);
+      if (EXPECT_RECEIPT) {
+        const isReceipt = ['approved', 'needs_review', 'duplicate'].includes(r.body.status);
+        record('  classified as a receipt', isReceipt, r.body.status);
+      }
+    } catch (e) { record('inbound runs Gemini + Sheets', false, e.message); }
+  } else {
+    console.log('… skipping the Gemini/Sheets check (pass --image path/to/photo.jpg to include it)');
+  }
 
   // 4. Gmail cron (optional)
   if (DO_GMAIL) {
