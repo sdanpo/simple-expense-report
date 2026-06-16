@@ -11,20 +11,25 @@ even a real receipt, and files it.
 | **Repo** | https://github.com/sdanpo/simple-expense-report (auto-deploys to Vercel on push to `master`) |
 
 > ### 🚧 In transition — new architecture (replacing Apps Script + FolderSync)
-> Sections 1–13 below describe the **current production** flow (Apps Script ingests
-> Gmail → Drive Inbox; FolderSync uploads phone photos). A **new path is being rolled
-> out** to make this a real product that's easy for non-techies to install:
-> - **Photos:** a native **Android app** replaces FolderSync — a normal camera photo
->   (even from the lock screen) is gated on-device and uploaded straight to the
->   backend. The app is its **own repo**:
->   **https://github.com/sdanpo/expense-report-android** (talks to this backend only
->   via `POST /api/inbound`).
-> - **Email:** `GET /api/cron/ingest-gmail` reads Gmail **directly on Vercel**
->   (no Apps Script, no Drive needed) and writes rows.
-> - **Upload endpoint:** `POST /api/inbound` accepts photos from the app.
-> - **New env vars:** `INBOUND_TOKENS` (+ optional `MAX_GMAIL_PER_RUN`) — see §8.
-> - **Tests:** backend `npm test` (vitest, 58). The old paths still work and are
->   untouched during the transition.
+> Sections 1–13 below still describe the **legacy** flow (Apps Script + FolderSync +
+> Drive Inbox). A new, easier-to-install path is **live and in use** — when reading
+> the legacy sections, keep this current picture in mind:
+>
+> | Receipt source | Legacy path | **Current path** |
+> |---|---|---|
+> | **Phone photo** | FolderSync → Drive Inbox → `process-invoices` | **Android app → `POST /api/inbound`** ✅ |
+> | **Email** | Apps Script → Drive Inbox → `process-invoices` | Apps Script *(still)*, or `GET /api/cron/ingest-gmail` *(ready, not scheduled)* |
+>
+> - **Android app (its own repo):** **https://github.com/sdanpo/expense-report-android**
+>   — a normal camera photo (even from the lock screen) is gated on-device and uploaded
+>   to `POST /api/inbound`. It talks to this backend over HTTP only.
+> - **`POST /api/inbound`** classifies with Gemini, **archives the image to Drive
+>   `/Processed`** (so the Sheet row links to it), and writes the row.
+> - **`GET /api/cron/ingest-gmail`** reads Gmail directly on Vercel (the Apps Script
+>   replacement) — ready but not scheduled yet, so Apps Script still handles email.
+> - **New env vars:** `INBOUND_TOKENS`, optional `MAX_GMAIL_PER_RUN`, and
+>   `GMAIL_REFRESH_TOKEN` (now also used by `/api/inbound` for Drive archival) — see §8.
+> - **Tests:** `npm test` (vitest, 62) + the app's `core` has 33 JVM tests.
 
 ---
 
@@ -75,7 +80,7 @@ In short: **Apps Script = the hands inside your Google account; Vercel = the edi
 |--------|----------------|----------------|
 | **Email with a PDF/image attachment** (Gett, Roamless, utility bills, "חשבונית מס") | Gmail filter labels it `AutoInvoiced`; Apps Script saves the attachment into Drive `Inbox` | Apps Script → Vercel |
 | **Email where the receipt is in the body text** (Uber, Metropark — no attachment) | Apps Script reads the message body and POSTs the text to Vercel `/api/admin/process-text` | Apps Script → Vercel |
-| **Photo taken on your phone** | A background photo-sync app (e.g. FolderSync) uploads it straight into Drive `Inbox` | Vercel picks it up on the next run |
+| **Photo taken on your phone** | *Current:* the **Android app** detects it, gates it on-device, and uploads to `POST /api/inbound`. *Legacy:* a sync app (FolderSync) uploaded it into Drive `Inbox`. | App → Vercel (`/api/inbound`) |
 
 Anything that lands in the Drive **Inbox** — whether put there by Apps Script or by the photo-sync
 app — is processed by Vercel on the next run.
@@ -200,7 +205,7 @@ Runs as you, hourly. Key functions:
 | Route | Purpose |
 |-------|---------|
 | `GET /api/cron/process-invoices` | **Main processor.** Process up to 4 Inbox files → Gemini → Sheet → move. Returns `{processed, remaining, results}`. Also the daily Vercel cron target. Auth: `Bearer CRON_SECRET`. |
-| `POST /api/inbound` | **NEW.** Photo upload from the Android app (multipart `file`). Gemini → dedup → Sheet. No Drive. Auth: `Bearer` token from `INBOUND_TOKENS`/`CRON_SECRET`. HTTP codes are a contract: `200` terminal, `401` re-auth, `413` too large, `503` retry. |
+| `POST /api/inbound` | **NEW.** Photo upload from the Android app (multipart `file`). Gemini → dedup → **archive image to Drive `/Processed` (best-effort, needs `GMAIL_REFRESH_TOKEN`) → Sheet row with `drive_link`**. Auth: `Bearer` token from `INBOUND_TOKENS`/`CRON_SECRET`. HTTP codes are a contract: `200` terminal, `401` re-auth, `413` too large, `503` retry. |
 | `GET /api/cron/ingest-gmail` | **NEW.** Reads invoice-like Gmail directly (search query, no filter), analyzes attachments + body text in memory, writes rows, labels messages done. **Replaces the Apps Script ingester.** Endpoint is ready but **not scheduled yet** — enable in `vercel.json` when retiring Apps Script. Auth: `Bearer CRON_SECRET`. |
 | `GET /api/setup` | Ensure the Sheet exists with headers; echo the configured IDs. |
 | `POST /api/admin/process-text` | Analyze a receipt delivered as **email body text** (Uber, Metropark). |
@@ -230,6 +235,8 @@ All `/api/**` routes are protected by `Authorization: Bearer <CRON_SECRET>` (exc
 - `gmail-ingest.ts` — **NEW.** Direct Gmail→Sheet ingestion (the Apps Script replacement); pure MIME
   helpers are unit-tested.
 - `inbound-auth.ts` — **NEW.** Bearer-token auth for `/api/inbound`.
+- `src/app/api/inbound/route.ts` — **NEW.** The app's photo endpoint: auth → size/type guards →
+  Gemini → dedup → best-effort Drive archival → Sheet row. Tested in `tests/inbound.route.test.ts`.
 
 ---
 
@@ -247,7 +254,7 @@ All `/api/**` routes are protected by `Authorization: Bearer <CRON_SECRET>` (exc
 | `CRON_SECRET` | Shared secret protecting the API routes; the **same value** goes in Apps Script `CONFIG.CRON_SECRET`. Also accepted as an `/api/inbound` token. |
 | `INBOUND_TOKENS` | **NEW.** Comma-separated bearer tokens accepted by `POST /api/inbound` (the Android app). Empty = allow all (dev only). The token also goes in the app build as `INBOUND_TOKEN`. |
 | `MAX_GMAIL_PER_RUN` | **NEW, optional.** Messages processed per `/api/cron/ingest-gmail` run; default `8`. |
-| `GMAIL_CLIENT_ID` / `_SECRET` / `_REFRESH_TOKEN` | Gmail OAuth token. Used by the new `ingest-gmail` cron (reads Gmail directly) and the legacy `gmail-to-inbox` route. |
+| `GMAIL_CLIENT_ID` / `_SECRET` / `_REFRESH_TOKEN` | Gmail+Drive OAuth (user token). Used by (a) `POST /api/inbound` to **archive receipt images into Drive `/Processed`** as you, and (b) the `ingest-gmail` cron. Mint the refresh token with `node scripts/setup-gmail-auth.js` (loopback flow; requests Gmail + Drive scopes). Without it, `/api/inbound` still records receipts but leaves `drive_link` empty. |
 
 ---
 
@@ -258,6 +265,12 @@ plumbing, deploy the app, then connect it to your Gmail and phone. Follow the pa
 
 > **What you'll need:** a Google account, a credit card (for Gemini billing — costs pennies),
 > and a GitHub + Vercel account (both have free tiers). No coding required — just copy/paste.
+>
+> **Doing the new photo path (Android app) instead of FolderSync?** Set `INBOUND_TOKENS` in
+> Vercel (Part 4), run `node scripts/setup-gmail-auth.js` to mint `GMAIL_REFRESH_TOKEN` (so
+> `/api/inbound` can archive images to Drive), then build + install the app from
+> **https://github.com/sdanpo/expense-report-android** (its README has the full guide). You can
+> skip Part 6 (FolderSync).
 
 ---
 
