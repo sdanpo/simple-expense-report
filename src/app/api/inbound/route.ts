@@ -3,6 +3,7 @@ import { analyzeDocument, isSupportedMimeType } from '@/lib/gemini';
 import { appendRow, ensureSheetHeaders, appendLog, getExistingDedupKeys, dedupKey } from '@/lib/sheets';
 import { isReceipt, analysisToRow, summarize, isPermanentError } from '@/lib/pipeline';
 import { authorizeInbound, getInboundTokens } from '@/lib/inbound-auth';
+import { uploadFileToDrive } from '@/lib/drive';
 
 export const maxDuration = 60;
 export const dynamic = 'force-dynamic';
@@ -100,7 +101,12 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ status: 'duplicate', summary: summarize(invoice) });
   }
 
-  const row = analysisToRow(invoice, { file_name: fileName, drive_link: '' });
+  // Archive the image to Drive /Processed (as the user) so the Sheet row links to
+  // the original. Best-effort: if the Drive user-token isn't configured, we still
+  // record the receipt with an empty link rather than failing the upload.
+  const driveLink = await archiveToDrive(buffer, fileName, mimeType, invoice);
+
+  const row = analysisToRow(invoice, { file_name: fileName, drive_link: driveLink });
   await appendRow(row);
   await safeLog(
     row.status === 'Approved' ? 'approved' : 'needs_review',
@@ -108,6 +114,32 @@ export async function POST(req: NextRequest) {
   );
 
   return NextResponse.json({ status: row.status.toLowerCase().replace(' ', '_'), row, summary: summarize(invoice) });
+}
+
+// Upload the image to Drive /Processed and return its webViewLink. Best-effort:
+// returns '' if Drive isn't configured (missing GMAIL_REFRESH_TOKEN) or fails.
+async function archiveToDrive(
+  buffer: Buffer,
+  fileName: string,
+  mimeType: string,
+  invoice: { vendor: string | null; invoice_date: string | null }
+): Promise<string> {
+  const folderId = process.env.GOOGLE_DRIVE_PROCESSED_ID;
+  if (!folderId || !process.env.GMAIL_REFRESH_TOKEN) return '';
+  try {
+    // Readable, sortable name: "<date>_<vendor>_<original>".
+    const prefix = [invoice.invoice_date, invoice.vendor]
+      .filter(Boolean)
+      .join('_')
+      .replace(/[^a-zA-Z0-9._\-֐-׿ ]/g, '_')
+      .slice(0, 80);
+    const name = prefix ? `${prefix}_${fileName}` : fileName;
+    const uploaded = await uploadFileToDrive(name, buffer, mimeType, folderId);
+    return uploaded.webViewLink ?? '';
+  } catch (err) {
+    console.error('Drive archival failed:', err instanceof Error ? err.message : err);
+    return '';
+  }
 }
 
 // Logging must never break ingestion.

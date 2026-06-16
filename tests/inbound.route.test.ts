@@ -21,14 +21,20 @@ vi.mock('@/lib/sheets', async (importOriginal) => {
   };
 });
 
+vi.mock('@/lib/drive', () => ({
+  uploadFileToDrive: vi.fn(async () => ({ id: 'f1', name: 'r.jpg', mimeType: 'image/jpeg', webViewLink: 'https://drive.google.com/file/d/f1/view' })),
+}));
+
 import { POST } from '@/app/api/inbound/route';
 import { analyzeDocument } from '@/lib/gemini';
 import { appendRow, getExistingDedupKeys } from '@/lib/sheets';
 import { dedupKey } from '@/lib/sheets';
+import { uploadFileToDrive } from '@/lib/drive';
 
 const mockAnalyze = vi.mocked(analyzeDocument);
 const mockAppendRow = vi.mocked(appendRow);
 const mockDedup = vi.mocked(getExistingDedupKeys);
+const mockDriveUpload = vi.mocked(uploadFileToDrive);
 
 const TOKEN = 'testtoken';
 
@@ -77,6 +83,9 @@ beforeEach(() => {
   vi.clearAllMocks();
   process.env.INBOUND_TOKENS = TOKEN;
   delete process.env.CRON_SECRET;
+  // Drive archival is off unless a test opts in (token + folder configured).
+  delete process.env.GMAIL_REFRESH_TOKEN;
+  delete process.env.GOOGLE_DRIVE_PROCESSED_ID;
   mockDedup.mockResolvedValue(new Set<string>());
 });
 
@@ -98,6 +107,49 @@ describe('/api/inbound — happy paths', () => {
     expect(res.status).toBe(200);
     expect(body.status).toBe('needs_review');
     expect(mockAppendRow).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not touch Drive when GMAIL_REFRESH_TOKEN is not configured (empty link)', async () => {
+    mockAnalyze.mockResolvedValue(receipt());
+    const res = await POST(buildReq({}));
+    const body = await res.json();
+    expect(body.row.drive_link).toBe('');
+    expect(mockDriveUpload).not.toHaveBeenCalled();
+  });
+});
+
+describe('/api/inbound — Drive archival', () => {
+  beforeEach(() => {
+    process.env.GMAIL_REFRESH_TOKEN = 'rt';
+    process.env.GOOGLE_DRIVE_PROCESSED_ID = 'folder1';
+  });
+
+  it('archives the image and links it in the row', async () => {
+    mockAnalyze.mockResolvedValue(receipt());
+    const res = await POST(buildReq({}));
+    const body = await res.json();
+    expect(mockDriveUpload).toHaveBeenCalledTimes(1);
+    // name is "<date>_<vendor>_<file>"
+    expect(mockDriveUpload.mock.calls[0][0]).toContain('Gett');
+    expect(mockDriveUpload.mock.calls[0][3]).toBe('folder1');
+    expect(body.row.drive_link).toBe('https://drive.google.com/file/d/f1/view');
+    expect(mockAppendRow).toHaveBeenCalledTimes(1);
+  });
+
+  it('still records the receipt if the Drive upload fails (empty link, no throw)', async () => {
+    mockAnalyze.mockResolvedValue(receipt());
+    mockDriveUpload.mockRejectedValueOnce(new Error('drive 403'));
+    const res = await POST(buildReq({}));
+    const body = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.row.drive_link).toBe('');
+    expect(mockAppendRow).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not archive non-receipts', async () => {
+    mockAnalyze.mockResolvedValue(receipt({ is_invoice: false }));
+    await POST(buildReq({}));
+    expect(mockDriveUpload).not.toHaveBeenCalled();
   });
 });
 
