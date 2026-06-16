@@ -1,5 +1,11 @@
 # Invoice Automation — Setup Guide
 
+> **Architecture note (current):** phone receipts are now captured by the **Android app**
+> (**https://github.com/sdanpo/expense-report-android**) which uploads to `POST /api/inbound`
+> — you no longer need FolderSync / "share to Drive." Email is still handled by Apps Script.
+> This guide covers the backend (Vercel) setup; see the README for the full picture and the
+> app repo's README for installing the phone app.
+
 ## What was already done for you
 
 - Google Drive folders created:
@@ -54,17 +60,18 @@ Also share the spreadsheet:
 
 ### 2b. Get refresh token
 ```bash
-cd F:\simple_expense_report
-set GMAIL_CLIENT_ID=YOUR_CLIENT_ID
-set GMAIL_CLIENT_SECRET=YOUR_CLIENT_SECRET
-node scripts/setup-gmail-auth.js
+GMAIL_CLIENT_ID=YOUR_CLIENT_ID GMAIL_CLIENT_SECRET=YOUR_CLIENT_SECRET \
+  node scripts/setup-gmail-auth.js
 ```
-Follow the instructions. Copy the `GMAIL_REFRESH_TOKEN` it prints.
+It prints a URL — open it, authorize (Gmail + Drive), and the script captures the code
+automatically via a local `http://localhost` callback (Google retired the old "oob" flow).
+Copy the `GMAIL_REFRESH_TOKEN` it prints.
 
-> The OAuth token requests **Gmail + Drive** scopes. Drive is required because the
-> service account has no personal-Drive storage quota, so Gmail attachments must be
-> uploaded into the Inbox folder **as you** (via this token). Invoice processing
-> itself (classify/extract/sheet/move) runs on the service account and needs no token.
+> The OAuth token requests **Gmail + Drive** scopes. Drive is required because the service
+> account has no personal-Drive storage quota, so files must be uploaded **as you**. This
+> token is used by `POST /api/inbound` to **archive app-uploaded receipt images into Drive
+> `/Processed`** (so the Sheet links to them) and by the `ingest-gmail` cron. Without it,
+> `/api/inbound` still records receipts but leaves `drive_link` empty.
 
 ---
 
@@ -97,6 +104,9 @@ In Vercel dashboard → your project → **Settings → Environment Variables**,
 | `GOOGLE_DRIVE_IGNORED_ID` | 1PctH71brnmHySD1VSolcy4kek3ca4svW |
 | `GOOGLE_SHEETS_ID` | 1dSWFwyXy9wdXMYpjPsrbRCPDVZj8_bI2d4qauCkIAA8 |
 | `CRON_SECRET` | Any random string (e.g. `openssl rand -hex 32`) |
+| `INBOUND_TOKENS` | Bearer token(s) the **Android app** uses for `POST /api/inbound` (comma-separated). The same value goes into the app build as `-PINBOUND_TOKEN`. |
+
+> After adding/changing env vars, **redeploy** (`vercel --prod`) so the functions pick them up.
 
 ### 3d. Redeploy with env vars
 ```bash
@@ -124,17 +134,22 @@ This creates the sheet headers.
 
 ## Daily Use
 
-### Add invoice via phone
-Take photo → tap Share → Google Drive → navigate to **Invoices/Inbox**
+### Add invoice via phone (current)
+Just **take a photo** with your normal camera. The **Android app** captures it
+automatically and uploads it — nothing to share or forward. (Install it from
+**https://github.com/sdanpo/expense-report-android**.)
 
 ### Add invoice via email
-Forward the email to dan.porat@gmail.com — it gets auto-ingested within the hour.
+Receipts in your Gmail are auto-ingested by Apps Script (within the hour).
 
 ### Add invoice manually
-Upload directly to the Inbox folder link above.
+`POST` an image to `/api/inbound` (with a `Bearer INBOUND_TOKENS` header), or use the
+admin endpoints (`/api/admin/process-url` for a public image URL).
 
 ---
 
 ## Cron Schedule
-- `:00` every hour → Gmail → Drive Inbox
-- `:30` every hour → Process Inbox → Sheets
+- **Apps Script** (hourly, as you): read labeled Gmail → Drive Inbox → trigger Vercel.
+- **Vercel cron** (daily 06:00 UTC): `/api/cron/process-invoices` backstop pass.
+- `/api/cron/ingest-gmail` exists (direct Gmail read) but is **not scheduled** yet.
+- `/api/inbound` is on-demand (the Android app calls it as photos are taken).
