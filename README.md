@@ -9,6 +9,8 @@ even a real receipt, and files it.
 |---|---|
 | **Live app (Vercel)** | https://simpleexpensereport.vercel.app |
 | **Repo** | https://github.com/sdanpo/simple-expense-report (auto-deploys to Vercel on push to `master`) |
+| **Android app** | https://github.com/sdanpo/expense-report-android |
+| **Multi-user design (proposed)** | [`docs/multi-user-option-b.md`](docs/multi-user-option-b.md) — frictionless onboarding; data in the user's own Drive |
 
 > ### 🚧 In transition — new architecture (replacing Apps Script + FolderSync)
 > Sections 1–13 below still describe the **legacy** flow (Apps Script + FolderSync +
