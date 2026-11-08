@@ -19,10 +19,11 @@ function quiet() {
 describe('defaultTenant', () => {
   it('is the original single-tenant env pair', () => {
     expect(defaultTenant(env({ GOOGLE_SHEETS_ID: 'sheet1', GOOGLE_DRIVE_PROCESSED_ID: 'folder1' })))
-      .toEqual({ id: 'default', sheetId: 'sheet1', processedFolderId: 'folder1' });
+      .toEqual({ id: 'default', sheetId: 'sheet1', processedFolderId: 'folder1', geminiApiKey: '' });
   });
   it('tolerates an unconfigured deployment without throwing', () => {
-    expect(defaultTenant(env({}))).toEqual({ id: 'default', sheetId: '', processedFolderId: '' });
+    expect(defaultTenant(env({})))
+      .toEqual({ id: 'default', sheetId: '', processedFolderId: '', geminiApiKey: '' });
   });
 });
 
@@ -38,12 +39,12 @@ describe('parseTenants', () => {
         { token: ' t1 ', id: ' hadas ', sheetId: ' s1 ', processedFolderId: ' f1 ' },
       ]),
     }));
-    expect(m.get('t1')).toEqual({ id: 'hadas', sheetId: 's1', processedFolderId: 'f1' });
+    expect(m.get('t1')).toEqual({ id: 'hadas', sheetId: 's1', processedFolderId: 'f1', geminiApiKey: '' });
   });
 
   it('allows a tenant with no Drive folder (row still written, no image link)', () => {
     const m = parseTenants(env({ INBOUND_TENANTS: JSON.stringify([{ token: 't', sheetId: 's' }]) }));
-    expect(m.get('t')).toEqual({ id: 'tenant', sheetId: 's', processedFolderId: '' });
+    expect(m.get('t')).toEqual({ id: 'tenant', sheetId: 's', processedFolderId: '', geminiApiKey: '' });
   });
 
   it('skips entries missing a token or a sheetId', () => {
@@ -126,14 +127,14 @@ describe('resolveTenant', () => {
 
   it('routes a tenant token to that tenant', () => {
     expect(resolveTenant('Bearer hadasToken', e))
-      .toEqual({ id: 'hadas', sheetId: 'hadasSheet', processedFolderId: 'hadasFolder' });
+      .toEqual({ id: 'hadas', sheetId: 'hadasSheet', processedFolderId: 'hadasFolder', geminiApiKey: '' });
   });
 
   // The whole back-compat promise in one test: an existing INBOUND_TOKENS/CRON_SECRET
   // device keeps writing exactly where it always did.
   it('routes an unknown-but-authorized token to the default tenant', () => {
     expect(resolveTenant('Bearer legacyToken', e))
-      .toEqual({ id: 'default', sheetId: 'ownerSheet', processedFolderId: 'ownerFolder' });
+      .toEqual({ id: 'default', sheetId: 'ownerSheet', processedFolderId: 'ownerFolder', geminiApiKey: '' });
   });
 
   it('routes a missing header to the default tenant (dev mode)', () => {
@@ -142,5 +143,44 @@ describe('resolveTenant', () => {
 
   it('does not prefix-match a token', () => {
     expect(resolveTenant('Bearer hadasTokenX', e).id).toBe('default');
+  });
+});
+
+describe('per-tenant Gemini key', () => {
+  it("parses a tenant's own key and trims it", () => {
+    const m = parseTenants(
+      env({ INBOUND_TENANTS: JSON.stringify([{ token: 't', sheetId: 's', geminiApiKey: '  AIzaOwn  ' }]) })
+    );
+    expect(m.get('t')!.geminiApiKey).toBe('AIzaOwn');
+  });
+
+  // Empty is the signal to fall back to the deployment key, so a tenant that supplies no
+  // key must not accidentally look like it supplied one.
+  it('leaves the key empty when the entry omits it', () => {
+    const m = parseTenants(
+      env({ INBOUND_TENANTS: JSON.stringify([{ token: 't', sheetId: 's' }]) })
+    );
+    expect(m.get('t')!.geminiApiKey).toBe('');
+  });
+
+  it('ignores a non-string key instead of throwing on the ingestion path', () => {
+    const m = parseTenants(
+      env({ INBOUND_TENANTS: JSON.stringify([{ token: 't', sheetId: 's', geminiApiKey: 42 }]) })
+    );
+    expect(m.get('t')!.geminiApiKey).toBe('');
+  });
+
+  // The owner must keep paying for the owner, so the default tenant never carries a key.
+  it('never puts the deployment key on the default tenant', () => {
+    expect(defaultTenant(env({ GEMINI_API_KEY: 'AIzaOwner' })).geminiApiKey).toBe('');
+  });
+
+  it('resolves the tenant key for that tenant and empty for everyone else', () => {
+    const e = env({
+      GOOGLE_SHEETS_ID: 'ownerSheet',
+      INBOUND_TENANTS: JSON.stringify([{ token: 'hers', sheetId: 'herSheet', geminiApiKey: 'AIzaHers' }]),
+    });
+    expect(resolveTenant('Bearer hers', e).geminiApiKey).toBe('AIzaHers');
+    expect(resolveTenant('Bearer someoneElse', e).geminiApiKey).toBe('');
   });
 });
