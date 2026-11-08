@@ -3,6 +3,7 @@ import { analyzeDocument, isSupportedMimeType } from '@/lib/gemini';
 import { appendRow, ensureSheetHeaders, appendLog, getExistingDedupKeys, dedupKey } from '@/lib/sheets';
 import { isReceipt, analysisToRow, summarize, isPermanentError } from '@/lib/pipeline';
 import { authorizeInbound, getInboundTokens } from '@/lib/inbound-auth';
+import { resolveTenant, tenantTokens, type Tenant } from '@/lib/tenants';
 import { uploadFileToDrive } from '@/lib/drive';
 
 export const maxDuration = 60;
@@ -29,8 +30,15 @@ const MIN_UPLOAD_BYTES = 1024; // 1 KB
  *   500  → unexpected. The app retries.
  */
 export async function POST(req: NextRequest) {
-  const auth = authorizeInbound(req.headers.get('authorization'), getInboundTokens());
+  const authHeader = req.headers.get('authorization');
+  const accepted = [...getInboundTokens(), ...tenantTokens()];
+  const auth = authorizeInbound(authHeader, accepted);
   if (!auth.ok) return NextResponse.json({ status: 'unauthorized', error: auth.reason }, { status: 401 });
+
+  // WHERE this upload goes. An unknown-but-authorized token (the original
+  // INBOUND_TOKENS/CRON_SECRET devices) resolves to the default tenant, so existing
+  // deployments are unaffected.
+  const tenant = resolveTenant(authHeader);
 
   // Parse multipart form.
   let form: FormData;
@@ -58,13 +66,13 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ status: 'too_large', error: `Max ${MAX_UPLOAD_BYTES} bytes` }, { status: 413 });
   }
   if (file.size < MIN_UPLOAD_BYTES) {
-    await safeLog('ignored', `${fileName} → too small (${file.size}B)`);
+    await safeLog(tenant.sheetId, 'ignored', `${fileName} → too small (${file.size}B)`);
     return NextResponse.json({ status: 'ignored_too_small' });
   }
 
   // Unsupported type is terminal — tell the app to drop it (200, not an error).
   if (!isSupportedMimeType(mimeType)) {
-    await safeLog('ignored', `${fileName} → unsupported type ${mimeType}`);
+    await safeLog(tenant.sheetId, 'ignored', `${fileName} → unsupported type ${mimeType}`);
     return NextResponse.json({ status: 'ignored_unsupported_type' });
   }
 
@@ -73,42 +81,43 @@ export async function POST(req: NextRequest) {
   // Analyze (classify + extract in one Gemini call).
   let invoice;
   try {
-    await ensureSheetHeaders();
+    await ensureSheetHeaders(tenant.sheetId);
     invoice = await analyzeDocument(buffer, mimeType);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     // Permanent (corrupt / safety refusal / no-JSON) → not a receipt, terminal.
     if (isPermanentError(err)) {
-      await safeLog('ignored', `${fileName} → unprocessable: ${message.slice(0, 80)}`);
+      await safeLog(tenant.sheetId, 'ignored', `${fileName} → unprocessable: ${message.slice(0, 80)}`);
       return NextResponse.json({ status: 'ignored_unprocessable' });
     }
     // Transient → ask the app to retry later.
-    await safeLog('error', `${fileName} → Gemini transient: ${message.slice(0, 80)}`);
+    await safeLog(tenant.sheetId, 'error', `${fileName} → Gemini transient: ${message.slice(0, 80)}`);
     return NextResponse.json({ status: 'retry', error: message }, { status: 503 });
   }
 
   if (!isReceipt(invoice)) {
-    await safeLog('ignored', `${fileName} → not a receipt`);
+    await safeLog(tenant.sheetId, 'ignored', `${fileName} → not a receipt`);
     return NextResponse.json({ status: 'not_a_receipt', analysis: invoice });
   }
 
   // Dedup against rows already in the Sheet (re-uploads, or multiple photos of the
   // same receipt) so a lost-ack retry never creates a second row.
-  const seen = await getExistingDedupKeys();
+  const seen = await getExistingDedupKeys(tenant.sheetId);
   const key = dedupKey(invoice);
   if (seen.has(key)) {
-    await safeLog('duplicate', `${fileName} → duplicate: ${summarize(invoice)}`);
+    await safeLog(tenant.sheetId, 'duplicate', `${fileName} → duplicate: ${summarize(invoice)}`);
     return NextResponse.json({ status: 'duplicate', summary: summarize(invoice) });
   }
 
   // Archive the image to Drive /Processed (as the user) so the Sheet row links to
   // the original. Best-effort: if the Drive user-token isn't configured, we still
   // record the receipt with an empty link rather than failing the upload.
-  const driveLink = await archiveToDrive(buffer, fileName, mimeType, invoice);
+  const driveLink = await archiveToDrive(buffer, fileName, mimeType, invoice, tenant);
 
   const row = analysisToRow(invoice, { file_name: fileName, drive_link: driveLink });
-  await appendRow(row);
+  await appendRow(row, tenant.sheetId);
   await safeLog(
+    tenant.sheetId,
     row.status === 'Approved' ? 'approved' : 'needs_review',
     `${fileName} → photo receipt: ${summarize(invoice)}${clientDedupId ? ` [${clientDedupId}]` : ''}`
   );
@@ -122,9 +131,10 @@ async function archiveToDrive(
   buffer: Buffer,
   fileName: string,
   mimeType: string,
-  invoice: { vendor: string | null; invoice_date: string | null }
+  invoice: { vendor: string | null; invoice_date: string | null },
+  tenant: Tenant
 ): Promise<string> {
-  const folderId = process.env.GOOGLE_DRIVE_PROCESSED_ID;
+  const folderId = tenant.processedFolderId;
   if (!folderId || !process.env.GMAIL_REFRESH_TOKEN) return '';
   try {
     // Readable, sortable name: "<date>_<vendor>_<original>".
@@ -143,9 +153,9 @@ async function archiveToDrive(
 }
 
 // Logging must never break ingestion.
-async function safeLog(event: string, detail: string): Promise<void> {
+async function safeLog(sheetId: string, event: string, detail: string): Promise<void> {
   try {
-    await appendLog([{ source: 'vercel', event, detail }]);
+    await appendLog([{ source: 'vercel', event, detail }], sheetId);
   } catch {
     /* ignore */
   }
