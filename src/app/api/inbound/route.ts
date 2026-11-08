@@ -82,7 +82,7 @@ export async function POST(req: NextRequest) {
   let invoice;
   try {
     await ensureSheetHeaders(tenant.sheetId);
-    invoice = await analyzeDocument(buffer, mimeType);
+    invoice = await analyzeDocument(buffer, mimeType, tenant.geminiApiKey);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     // Permanent (corrupt / safety refusal / no-JSON) → not a receipt, terminal.
