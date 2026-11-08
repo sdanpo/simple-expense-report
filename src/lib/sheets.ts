@@ -16,9 +16,9 @@ const HEADERS = [
   'processed_at',
 ];
 
-export async function ensureSheetHeaders(): Promise<void> {
+export async function ensureSheetHeaders(sheetId?: string): Promise<void> {
   const sheets = getSheetsClient();
-  const spreadsheetId = process.env.GOOGLE_SHEETS_ID!;
+  const spreadsheetId = sheetId || process.env.GOOGLE_SHEETS_ID!;
 
   // Check if sheet exists, create if not
   const meta = await sheets.spreadsheets.get({ spreadsheetId });
@@ -61,9 +61,9 @@ export interface LogEntry {
   detail: string;
 }
 
-async function ensureLogSheet(): Promise<void> {
+async function ensureLogSheet(sheetId?: string): Promise<void> {
   const sheets = getSheetsClient();
-  const spreadsheetId = process.env.GOOGLE_SHEETS_ID!;
+  const spreadsheetId = sheetId || process.env.GOOGLE_SHEETS_ID!;
   const meta = await sheets.spreadsheets.get({ spreadsheetId });
   const existing = meta.data.sheets?.find((s) => s.properties?.title === LOG_SHEET);
   if (!existing) {
@@ -81,12 +81,12 @@ async function ensureLogSheet(): Promise<void> {
 }
 
 /** Append one or more entries to the Log tab. Never throws — logging must not break processing. */
-export async function appendLog(entries: LogEntry[]): Promise<void> {
+export async function appendLog(entries: LogEntry[], sheetId?: string): Promise<void> {
   if (entries.length === 0) return;
   try {
-    await ensureLogSheet();
+    await ensureLogSheet(sheetId);
     const sheets = getSheetsClient();
-    const spreadsheetId = process.env.GOOGLE_SHEETS_ID!;
+    const spreadsheetId = sheetId || process.env.GOOGLE_SHEETS_ID!;
     const ts = new Date().toISOString();
     await sheets.spreadsheets.values.append({
       spreadsheetId,
@@ -141,9 +141,9 @@ export function dedupKey(x: {
 }
 
 // Keys for every receipt already in the Invoices sheet (for dedup).
-export async function getExistingDedupKeys(): Promise<Set<string>> {
+export async function getExistingDedupKeys(sheetId?: string): Promise<Set<string>> {
   const sheets = getSheetsClient();
-  const spreadsheetId = process.env.GOOGLE_SHEETS_ID!;
+  const spreadsheetId = sheetId || process.env.GOOGLE_SHEETS_ID!;
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId,
     range: `${SHEET_NAME}!A2:F`, // vendor..invoice_number (no header)
@@ -155,9 +155,9 @@ export async function getExistingDedupKeys(): Promise<Set<string>> {
   return keys;
 }
 
-export async function appendRow(row: SheetRow): Promise<void> {
+export async function appendRow(row: SheetRow, sheetId?: string): Promise<void> {
   const sheets = getSheetsClient();
-  const spreadsheetId = process.env.GOOGLE_SHEETS_ID!;
+  const spreadsheetId = sheetId || process.env.GOOGLE_SHEETS_ID!;
 
   const values = [
     row.vendor,
