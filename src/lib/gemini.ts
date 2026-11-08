@@ -1,4 +1,4 @@
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GoogleGenerativeAI, type GenerativeModel } from '@google/generative-ai';
 import type { DocumentAnalysis } from './types';
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
@@ -6,6 +6,32 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 // SEPARATE pool from gemini-2.5-flash / 2.0-flash (which are tiny: ~20 requests/day).
 // Override with the GEMINI_MODEL env var if quotas change again.
 const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite' });
+
+/**
+ * Per-tenant Gemini clients.
+ *
+ * The owner's key stays the default: with no key the shared module-level `model` is used,
+ * so an existing deployment behaves exactly as before. A tenant that brings its OWN key
+ * gets its own client, so the AI cost and the free-tier quota land on THEIR account rather
+ * than the owner's — which is the whole point of letting them supply one.
+ *
+ * Clients are cached per key: building one per upload would be wasteful on a hot path, and
+ * the key set is tiny (one per tenant).
+ */
+const tenantModels = new Map<string, GenerativeModel>();
+
+function modelFor(apiKey?: string): GenerativeModel {
+  const key = (apiKey ?? '').trim();
+  if (!key) return model;
+  let m = tenantModels.get(key);
+  if (!m) {
+    m = new GoogleGenerativeAI(key).getGenerativeModel({
+      model: process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite',
+    });
+    tenantModels.set(key, m);
+  }
+  return m;
+}
 
 const SUPPORTED_MIME_TYPES = new Set([
   'image/jpeg',
@@ -35,11 +61,16 @@ function isTransient(err: unknown): boolean {
 }
 
 // Call Gemini with retry/backoff on transient (overload / rate-limit) errors.
-async function generateWithRetry(content: Buffer, mimeType: string, prompt: string): Promise<unknown> {
+async function generateWithRetry(
+  content: Buffer,
+  mimeType: string,
+  prompt: string,
+  apiKey?: string
+): Promise<unknown> {
   let lastErr: unknown;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
-      const result = await model.generateContent([
+      const result = await modelFor(apiKey).generateContent([
         prompt,
         { inlineData: { data: content.toString('base64'), mimeType } },
       ]);
@@ -104,9 +135,10 @@ Rules: do not invent values; use null if unknown.`;
 
 export async function analyzeDocument(
   content: Buffer,
-  mimeType: string
+  mimeType: string,
+  apiKey?: string
 ): Promise<DocumentAnalysis> {
-  return (await generateWithRetry(content, mimeType, ANALYZE_PROMPT)) as DocumentAnalysis;
+  return (await generateWithRetry(content, mimeType, ANALYZE_PROMPT, apiKey)) as DocumentAnalysis;
 }
 
 /** Same analysis for receipts that arrive as email body text (Uber, Metropark, etc.). */
