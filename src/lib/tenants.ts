@@ -32,6 +32,11 @@ export interface Tenant {
   sheetId: string;
   /** Drive folder for archived images. Empty ⇒ skip archival, still write the row. */
   processedFolderId: string;
+  /**
+   * This tenant's own Gemini API key. Empty ⇒ fall back to the deployment's GEMINI_API_KEY,
+   * i.e. the owner pays. Set it so the tenant's own account carries the AI cost and quota.
+   */
+  geminiApiKey: string;
 }
 
 /** The single-tenant configuration the system shipped with. */
@@ -40,6 +45,9 @@ export function defaultTenant(env: NodeJS.ProcessEnv = process.env): Tenant {
     id: 'default',
     sheetId: (env.GOOGLE_SHEETS_ID ?? '').trim(),
     processedFolderId: (env.GOOGLE_DRIVE_PROCESSED_ID ?? '').trim(),
+    // Deliberately empty: the default tenant uses the module-level client built from
+    // GEMINI_API_KEY, so behaviour is byte-identical to before this field existed.
+    geminiApiKey: '',
   };
 }
 
@@ -83,8 +91,9 @@ export function parseTenants(env: NodeJS.ProcessEnv = process.env): Map<string, 
     const id = typeof e.id === 'string' && e.id.trim() ? e.id.trim() : 'tenant';
     const processedFolderId =
       typeof e.processedFolderId === 'string' ? e.processedFolderId.trim() : '';
+    const geminiApiKey = typeof e.geminiApiKey === 'string' ? e.geminiApiKey.trim() : '';
 
-    out.set(token, { id, sheetId, processedFolderId });
+    out.set(token, { id, sheetId, processedFolderId, geminiApiKey });
   }
   return out;
 }
